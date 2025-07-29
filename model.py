@@ -57,6 +57,7 @@ class RectifiedFlow(nn.Module):
         
         images = [z]
         t_span = torch.linspace(0, 1, sample_steps, device=self.device)
+        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         for t in tqdm(reversed(t_span)):
             if self.use_cond:
                 v_t = self.net.forward_with_cfg(z, t, y, cfg_scale)
@@ -79,6 +80,7 @@ class RectifiedFlow(nn.Module):
         
         images = []
         t_span = torch.linspace(0, 1, sample_steps, device=self.device)
+        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         for t in tqdm(reversed(t_span)):
             v_t = self.net.forward_with_cfg(z, t, c, cfg_scale)
             z = z - v_t / sample_steps

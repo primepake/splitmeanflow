@@ -1,4 +1,4 @@
-name: dit
+name: splitmeanflow
 channels:
   - conda-forge
 dependencies:
