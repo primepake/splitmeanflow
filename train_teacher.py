@@ -14,13 +14,40 @@ from model import RectifiedFlow
 from fid_evaluation import FIDEvaluation
 
 import moviepy.editor as mpy
-import wandb
+from comet_ml import Experiment
+import os
 
 
 def main():
     n_steps = 200000
     device = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = 128
+    
+    # Create directories
+    os.makedirs('images', exist_ok=True)
+
+    # Initialize Comet ML experiment
+    experiment = Experiment(
+        api_key="YOUR_API_KEY",  # Replace with your Comet ML API key
+        project_name="dit-flow-matching",
+        workspace="YOUR_WORKSPACE",  # Replace with your workspace
+    )
+    
+    # Log hyperparameters
+    experiment.log_parameters({
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "learning_rate": 1e-4,
+        "model": "DiT",
+        "dim": 384,
+        "depth": 12,
+        "num_heads": 6,
+        "patch_size": 2,
+        "dropout_prob": 0.1,
+        "optimizer": "AdamW8bit",
+        "mixed_precision": "bfloat16",
+        "ema_decay": 0.9999,
+    })
 
     dataset = torchvision.datasets.CIFAR10(
         root="/mnt/g",
@@ -57,12 +84,9 @@ def main():
     sampler = RectifiedFlow(model)
     scaler = torch.cuda.amp.GradScaler()
 
-    logger = wandb.init(project="dit-cfm")
     fid_eval = FIDEvaluation(batch_size * 2, train_dataloader, sampler)
     
     def sample_and_log_images():
-        log_imgs = []
-        log_gifs = []
         for cfg_scale in [1.0, 2.5, 5.0]:
             print(
                 f"Sampling images at step {step} with cfg_scale {cfg_scale}..."
@@ -71,23 +95,32 @@ def main():
             log_img = make_grid(traj[-1], nrow=10)
             img_save_path = f"images/step{step}_cfg{cfg_scale}.png"
             save_image(log_img, img_save_path)
-            log_imgs.append(
-                wandb.Image(img_save_path, caption=f"cfg_scale: {cfg_scale}")
+            
+            # Log image to Comet ML
+            experiment.log_image(
+                img_save_path,
+                name=f"cfg_{cfg_scale}",
+                step=step
             )
-            # print(f"Saved images to {img_save_path}")
+            
+            # Create and save GIF
             images_list = [
                 make_grid(frame, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
                 for frame in traj
             ]
             clip = mpy.ImageSequenceClip(images_list, fps=10)
-            clip.write_gif(f"images/step{step}_cfg{cfg_scale}.gif")
-            log_gifs.append(
-                wandb.Video(
-                    f"images/step{step}_cfg{cfg_scale}.gif",
-                    caption=f"cfg_scale: {cfg_scale}",
-                )
+            gif_path = f"images/step{step}_cfg{cfg_scale}.gif"
+            clip.write_gif(gif_path)
+            
+            # Log GIF to Comet ML
+            experiment.log_image(
+                gif_path,
+                name=f"trajectory_cfg_{cfg_scale}",
+                step=step,
+                image_format="gif"
             )
 
+            # Sample with EMA
             print("Copying EMA to model...")
             model_ema.store(model.parameters())
             model_ema.copy_to(model)
@@ -98,27 +131,32 @@ def main():
             log_img = make_grid(traj[-1], nrow=10)
             img_save_path = f"images/step{step}_cfg{cfg_scale}_ema.png"
             save_image(log_img, img_save_path)
-            # print(f"Saved images to {img_save_path}")
-            log_imgs.append(
-                wandb.Image(
-                    img_save_path, caption=f"EMA with cfg_scale: {cfg_scale}"
-                )
+            
+            # Log EMA image to Comet ML
+            experiment.log_image(
+                img_save_path,
+                name=f"ema_cfg_{cfg_scale}",
+                step=step
             )
             
+            # Create and save EMA GIF
             images_list = [
                 make_grid(frame, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
                 for frame in traj
             ]
             clip = mpy.ImageSequenceClip(images_list, fps=10)
-            clip.write_gif(f"images/step{step}_cfg{cfg_scale}_ema.gif")
-            log_gifs.append(
-                wandb.Video(
-                    f"images/step{step}_cfg{cfg_scale}_ema.gif",
-                    caption=f"EMA with cfg_scale: {cfg_scale}",
-                )
+            gif_path_ema = f"images/step{step}_cfg{cfg_scale}_ema.gif"
+            clip.write_gif(gif_path_ema)
+            
+            # Log EMA GIF to Comet ML
+            experiment.log_image(
+                gif_path_ema,
+                name=f"ema_trajectory_cfg_{cfg_scale}",
+                step=step,
+                image_format="gif"
             )
+            
             model_ema.restore(model.parameters())
-        logger.log({"Images": log_imgs, "Gifs": log_gifs, "step": step})
     
     losses = []
     with tqdm(range(n_steps), dynamic_ncols=True) as pbar:
@@ -145,16 +183,19 @@ def main():
             if not torch.isnan(loss):
                 losses.append(loss.item())
                 pbar.set_postfix({"loss": loss.item()})
-                logger.log({"loss": loss.item(), "step": step})
+                experiment.log_metric("loss", loss.item(), step=step)
 
             
             if step % 10000 == 0 or step == n_steps - 1:
+                avg_loss = sum(losses) / len(losses) if losses else 0
                 print(
-                    f"Step: {step+1}/{n_steps} | loss: {sum(losses) / len(losses):.4f}"
+                    f"Step: {step+1}/{n_steps} | loss: {avg_loss:.4f}"
                 )
+                experiment.log_metric("avg_loss_10k", avg_loss, step=step)
                 losses.clear()
+                
                 model.eval()
-                with torch.autocast(dtype=torch.bfloat16):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     sample_and_log_images()
                 model.train()
                 
@@ -164,20 +205,46 @@ def main():
                 model_ema.store(model.parameters())
                 model_ema.copy_to(model)
                 
-                with torch.autocast(dtype=torch.bfloat16):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     fid_score = fid_eval.fid_score()
                 print(f"FID score with EMA at step {step}: {fid_score}")
                 
                 model_ema.restore(model.parameters())
                 model.train()
                 
-                wandb.log({"FID": fid_score, "step": step})
+                experiment.log_metric("FID", fid_score, step=step)
+                
+                # Save checkpoint
+                checkpoint_path = f"checkpoint_step{step}.pth"
+                state_dict = {
+                    "model": model.state_dict(),
+                    "ema": model_ema.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                }
+                torch.save(state_dict, checkpoint_path)
+                
+                # Log model checkpoint to Comet ML
+                experiment.log_model(
+                    name=f"checkpoint_step_{step}",
+                    file_or_folder=checkpoint_path
+                )
 
+    # Final save
     state_dict = {
         "model": model.state_dict(),
         "ema": model_ema.state_dict(),
     }
     torch.save(state_dict, "model.pth")
+    
+    # Log final model
+    experiment.log_model(
+        name="final_model",
+        file_or_folder="model.pth"
+    )
+    
+    # End the experiment
+    experiment.end()
 
 
 if __name__ == "__main__":
