@@ -228,8 +228,9 @@ class DiT(nn.Module):
 
         #pack cls token and register token
         x, ps = pack([x, r], 'b * d ')
-        
-        t = self.t_embedder(t)                   # (N, D)
+        print('t shape: ', t.shape)
+        t = self.t_embedder(t)       
+        print('t t_embedder: ', t.shape)            # (N, D)
         c = t
         if self.use_cond:
             y = self.y_embedder(y, self.training)    # (N, D)
