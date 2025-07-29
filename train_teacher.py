@@ -28,9 +28,7 @@ def main():
 
     # Initialize Comet ML experiment
     experiment = Experiment(
-        api_key="YOUR_API_KEY",  # Replace with your Comet ML API key
         project_name="dit-flow-matching",
-        workspace="YOUR_WORKSPACE",  # Replace with your workspace
     )
     
     # Log hyperparameters
@@ -50,7 +48,7 @@ def main():
     })
 
     dataset = torchvision.datasets.CIFAR10(
-        root="/mnt/g",
+        root="/mnt/nvme",
         train=True,
         download=True,
         transform=T.Compose([T.ToTensor(), T.RandomHorizontalFlip()]),
@@ -172,6 +170,7 @@ def main():
 
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1, t)
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                print('xt shape: ', xt.shape, 't shape: ', t.shape, 'y shape: ', y.shape)
                 vt = model(xt, t, y)
                 loss = torch.mean((vt - ut) ** 2)
 
