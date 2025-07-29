@@ -228,13 +228,16 @@ class DiT(nn.Module):
 
         #pack cls token and register token
         x, ps = pack([x, r], 'b * d ')
-        
+        print('tshape: ', t.shape)
         t = self.t_embedder(t)                   # (N, D)
+        print('t_embedder: ', t.shape)
         c = t
         if self.use_cond:
             y = self.y_embedder(y, self.training)    # (N, D)
         c = c + y                                # (N, D)
+        # print('x shape: ', x.shape, 'c.shape: ', c.shape, 'y.shape: ', y.shape)
         print('x shape: ', x.shape, 'c.shape: ', c.shape, 'y.shape: ', y.shape)
+        # x shape:  torch.Size([200, 260, 384]) c.shape:  torch.Size([200, 384]) y.shape:  torch.Size([200, 384])
         for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             
