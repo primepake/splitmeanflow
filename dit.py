@@ -5,7 +5,7 @@ import math
 from timm.models.vision_transformer import PatchEmbed, Mlp
 from timm.models.vision_transformer import Attention
 import torch.nn.functional as F
-from einops import repeat, pack, unpack
+from einops import repeat, pack, unpack, rearrange
 
 
 def modulate(x, scale, shift):
@@ -210,7 +210,7 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, is_train=False):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -226,17 +226,12 @@ class DiT(nn.Module):
             b=x.shape[0]
         )
 
-        #pack cls token and register token
         x, ps = pack([x, r], 'b * d ')
-        print('t shape: ', t.shape)
-        t = self.t_embedder(t)       
-        print('t t_embedder: ', t.shape)            # (N, D)
+        t = self.t_embedder(t)                   # (N, D)
         c = t
         if self.use_cond:
             y = self.y_embedder(y, self.training)    # (N, D)
         c = c + y                                # (N, D)
-        print('x shape: ', x.shape, 'c.shape: ', c.shape, 'y.shape: ', y.shape)
-        # x shape:  torch.Size([200, 260, 384]) c.shape:  torch.Size([200, 384]) y.shape:  torch.Size([200, 384])
         for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             
