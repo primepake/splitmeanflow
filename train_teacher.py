@@ -73,6 +73,7 @@ def main():
     # Initialize Comet ML experiment
     experiment = Experiment(
         project_name="dit-flow-matching-vae",
+
     )
     
     # Log hyperparameters
@@ -357,7 +358,6 @@ def main():
                 y = y * cfg_mask
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                # Reshape t for the model
                 t_input = t.squeeze()  # Remove extra dimensions
                 pred = model(x_t, t_input, y)
                 positive_loss = F.mse_loss(pred, u_positive)
