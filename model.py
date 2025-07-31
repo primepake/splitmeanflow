@@ -65,7 +65,7 @@ class LogitNormalCosineScheduler:
         
         return alpha_t, sigma_t
 
-    def get_velocity_target(self, x1: torch.Tensor, z: torch.Tensor, t: torch.Tensor, sigma_min: float = 1e-6) -> torch.Tensor:
+    def get_velocity_target(self, x1: torch.Tensor, z: torch.Tensor, sigma_min: float = 1e-6) -> torch.Tensor:
         """
         Compute velocity target for cosine-scheduled flow matching.
         

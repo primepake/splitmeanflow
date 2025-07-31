@@ -12,30 +12,69 @@ def modulate(x, scale, shift):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+# class TimestepEmbedder(nn.Module):
+#     def __init__(self, dim, nfreq=256):
+#         super().__init__()
+#         self.mlp = nn.Sequential(nn.Linear(nfreq, dim), nn.SiLU(), nn.Linear(dim, dim))
+#         self.nfreq = nfreq
+
+#     @staticmethod
+#     def timestep_embedding(t, dim, max_period=10000):
+#         half_dim = dim // 2
+#         freqs = torch.exp(
+#             -math.log(max_period)
+#             * torch.arange(start=0, end=half_dim, dtype=torch.float32)
+#             / half_dim
+#         ).to(device=t.device)
+#         args = t[:, None].float() * freqs[None]
+#         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+#         if dim % 2:
+#             embedding = torch.cat(
+#                 [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+#             )
+#         return embedding
+
+#     def forward(self, t):
+#         t_freq = self.timestep_embedding(t, self.nfreq)
+#         t_emb = self.mlp(t_freq)
+#         return t_emb
+
 class TimestepEmbedder(nn.Module):
-    def __init__(self, dim, nfreq=256):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(nfreq, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.nfreq = nfreq
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        half_dim = dim // 2
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half_dim, dtype=torch.float32)
-            / half_dim
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.nfreq)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -143,11 +182,6 @@ class DiT(nn.Module):
         self.use_cond = num_classes is not None
         self.y_embedder = LabelEmbedder(num_classes, dim, class_dropout_prob) if self.use_cond else None
         
-        #register tokens
-        self.register_tokens = nn.Parameter(
-            torch.randn(num_register_tokens, dim)
-        )
-        
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, dim), requires_grad=False)
@@ -217,38 +251,28 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        H, W = x.shape[-2:]
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        #repeat register token
-        r = repeat(
-            self.register_tokens, 
-            'n d -> b n d', 
-            b=x.shape[0]
-        )
-
-        x, ps = pack([x, r], 'b * d ')
         t = self.t_embedder(t)                   # (N, D)
-        c = t
-        if self.use_cond:
-            y = self.y_embedder(y, self.training)    # (N, D)
-            c = c + y
-                                       # (N, D)
-        for i, block in enumerate(self.blocks):
-            x = block(x, c)                      # (N, T, D)
-            
-        #unpack cls token and register token
-        x, _ = unpack(x, ps, 'b * d')
+        y = self.y_embedder(y, self.training)    # (N, D)
+        c = t + y                                # (N, D)
+        for block in self.blocks:
+            x = block(x, c)
         
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, is_train_student=False):
         x = x.repeat(2, 1, 1, 1)
-        t = t.repeat(x.shape[0])
+        if is_train_student:
+            t = t.repeat(2)
+        else:
+            t = t.repeat(x.shape[0])
         y = y.repeat(2)
         y[len(x) // 2:] = self.y_embedder.num_classes
-        
+        print('x.shape', x.shape)
+        print('t.shape', t.shape)
+        print('y.shape', y.shape)
         model_out = self.forward(x, t, y)
         cond_eps, uncond_eps = model_out.split(len(x) // 2)
         out = uncond_eps + (cond_eps - uncond_eps) * cfg_scale
