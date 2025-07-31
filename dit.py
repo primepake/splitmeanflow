@@ -143,11 +143,6 @@ class DiT(nn.Module):
         self.use_cond = num_classes is not None
         self.y_embedder = LabelEmbedder(num_classes, dim, class_dropout_prob) if self.use_cond else None
         
-        #register tokens
-        self.register_tokens = nn.Parameter(
-            torch.randn(num_register_tokens, dim)
-        )
-        
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, dim), requires_grad=False)
@@ -217,27 +212,12 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        H, W = x.shape[-2:]
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        #repeat register token
-        r = repeat(
-            self.register_tokens, 
-            'n d -> b n d', 
-            b=x.shape[0]
-        )
-
-        x, ps = pack([x, r], 'b * d ')
         t = self.t_embedder(t)                   # (N, D)
-        c = t
-        if self.use_cond:
-            y = self.y_embedder(y, self.training)    # (N, D)
-            c = c + y
-                                       # (N, D)
-        for i, block in enumerate(self.blocks):
-            x = block(x, c)                      # (N, T, D)
-            
-        #unpack cls token and register token
-        x, _ = unpack(x, ps, 'b * d')
+        y = self.y_embedder(y, self.training)    # (N, D)
+        c = t + y                                # (N, D)
+        for block in self.blocks:
+            x = block(x, c)
         
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
