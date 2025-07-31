@@ -45,7 +45,7 @@ def main():
     # Direct image settings
     image_size = 16  # Smaller image size for direct generation
     image_channels = 3  # RGB channels
-    
+    num_classes = 10
     # Create directories
     os.makedirs('/mnt/nvme/images', exist_ok=True)
     os.makedirs('/mnt/nvme/results', exist_ok=True)
@@ -117,7 +117,7 @@ def main():
         dim=384,
         depth=12,
         num_heads=6,
-        num_classes=10,
+        num_classes=num_classes,
         learn_sigma=False,
         class_dropout_prob=0.1,
     ).to(device)
@@ -137,7 +137,7 @@ def main():
         device=device,
         channels=image_channels,
         image_size=image_size,
-        num_classes=10,
+        num_classes=num_classes,
         use_logit_normal_cosine=True,
         logit_normal_loc=0.0,
         logit_normal_scale=1.0,
@@ -150,7 +150,7 @@ def main():
         device=device,
         channels=image_channels,
         image_size=image_size,
-        num_classes=10,
+        num_classes=num_classes,
         use_logit_normal_cosine=True,
         logit_normal_loc=0.0,
         logit_normal_scale=1.0,
@@ -272,7 +272,7 @@ def main():
             b = x1.shape[0]
             print('x input and y class: ', x1.shape, y.shape)
             # Convert to [-1, 1] for training
-            x1 = x1 * 2 - 1
+            # x1 = x1 * 2 - 1
             
             # Sample timesteps with cosine schedule
             # t = torch.randn([b, 1, 1, 1], device=device)
@@ -332,8 +332,8 @@ def main():
 
             # Classifier-free guidance dropout
             if training_cfg_rate > 0:
-                cfg_mask = torch.rand(b, device=x1.device) > training_cfg_rate
-                y = y * cfg_mask
+                drop_mask = torch.rand(b, device=x1.device) < training_cfg_rate
+                y = torch.where(drop_mask, num_classes, y)
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 # Forward pass

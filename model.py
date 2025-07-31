@@ -206,12 +206,13 @@ class RectifiedFlow(nn.Module):
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
         
-        z_final = unnormalize_to_0_1(z.clip(-1, 1))
+        # z_final = unnormalize_to_0_1(z.clip(-1, 1))
         # z_final = z.clip(-1, 1)
+        z_final = z
 
         if return_all_steps:
             # Return both final image and full trajectory
-            return z_final, torch.stack(images)  # Keep trajectory in [-1, 1] for GIF creation
+            return z_final, torch.stack(images)
         return z_final
         
     
@@ -250,8 +251,9 @@ class RectifiedFlow(nn.Module):
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
         
-        z_final = unnormalize_to_0_1(z.clip(-1, 1))
+        # z_final = unnormalize_to_0_1(z.clip(-1, 1))
         # z_final = z.clip(-1, 1)
+        z_final = z
     
         if return_all_steps:
             # Return both final image and full trajectory
