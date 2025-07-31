@@ -207,8 +207,8 @@ class RectifiedFlow(nn.Module):
                 dt = t_span[step + 1] - t
         
         # z_final = unnormalize_to_0_1(z.clip(-1, 1))
-        # z_final = z.clip(-1, 1)
-        z_final = z
+        z_final = z.clip(-1, 1)
+        # z_final = z
 
         if return_all_steps:
             # Return both final image and full trajectory
@@ -252,8 +252,8 @@ class RectifiedFlow(nn.Module):
                 dt = t_span[step + 1] - t
         
         # z_final = unnormalize_to_0_1(z.clip(-1, 1))
-        # z_final = z.clip(-1, 1)
-        z_final = z
+        z_final = z.clip(-1, 1)
+        # z_final = z
     
         if return_all_steps:
             # Return both final image and full trajectory

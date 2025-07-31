@@ -16,31 +16,12 @@ from comet_ml import Experiment
 import os
 import torch.optim as optim
 import torch.nn.functional as F
-    
-
-
-# Clean EMA functions
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """Step the EMA model towards the current model."""
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-
-def requires_grad(model, flag=True):
-    """Set requires_grad flag for all parameters in a model."""
-    for p in model.parameters():
-        p.requires_grad = flag
 
 
 def main():
     n_steps = 200000
     device = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = 64
-    ema_decay = 0.9999
     
     # Direct image settings
     image_size = 16  # Smaller image size for direct generation
@@ -70,7 +51,6 @@ def main():
         "dropout_prob": 0.1,
         "optimizer": "Adam",
         "mixed_precision": "bfloat16",
-        "ema_decay": ema_decay,
         "fid_subset_size": 1000,
         "image_size": image_size,
         "image_channels": image_channels,
@@ -79,7 +59,7 @@ def main():
         "sigma_min": 1e-06,
     })
 
-    # Dataset with normalization to [0, 1]
+    # Dataset with normalization to [-1, 1]
     dataset = torchvision.datasets.CIFAR10(
         root="/mnt/nvme/",
         train=True,
@@ -88,6 +68,7 @@ def main():
             T.Resize((image_size, image_size)),
             T.RandomHorizontalFlip(),
             T.ToTensor(),  # This converts to [0, 1]
+            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # Convert to [-1, 1]
         ]),
     )
 
@@ -122,31 +103,11 @@ def main():
         class_dropout_prob=0.1,
     ).to(device)
     
-    # Create EMA model
-    print("Creating EMA model...")
-    model_ema = deepcopy(model).to(device)
-    requires_grad(model_ema, False)
-    model_ema.eval()
-    update_ema(model_ema, model, decay=0)  # Full copy
-    
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)
     
-    # Create samplers
+    # Create sampler
     sampler = RectifiedFlow(
         model,
-        device=device,
-        channels=image_channels,
-        image_size=image_size,
-        num_classes=num_classes,
-        use_logit_normal_cosine=True,
-        logit_normal_loc=0.0,
-        logit_normal_scale=1.0,
-        timestep_min=1e-8,
-        timestep_max=1.0-1e-8,
-    )
-    
-    sampler_ema = RectifiedFlow(
-        model_ema,
         device=device,
         channels=image_channels,
         image_size=image_size,
@@ -181,6 +142,7 @@ def main():
         transform=T.Compose([
             T.Resize((image_size, image_size)),
             T.ToTensor(),
+            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]),
     )
     
@@ -193,20 +155,20 @@ def main():
     )
     
     fid_dataloader_limited = limited_cycle(fid_dataloader, fid_batches_needed)
-    fid_eval = FIDEvaluation(batch_size, fid_dataloader_limited, sampler_ema, num_fid_samples=100)
+    fid_eval = FIDEvaluation(batch_size, fid_dataloader_limited, sampler, num_fid_samples=100)
     
     def sample_and_log_images():
-        """Sample images from both regular and EMA models"""
+        """Sample images from model"""
         for cfg_scale in [1.0, 2.5, 5.0]:
             print(f"Sampling images at step {step} with cfg_scale {cfg_scale}...")
             
-            # Sample from regular model
+            # Sample from model
             model.eval()
             with torch.no_grad():
                 # Use the model's own sampling method
                 samples, trajectory = sampler.sample_each_class(10, cfg_scale=cfg_scale, return_all_steps=True)
                 
-                log_img = make_grid(samples, nrow=10)
+                log_img = make_grid(samples, nrow=10, normalize=True, value_range=(-1, 1))
                 img_save_path = f"/mnt/nvme/images/step{step}_cfg{cfg_scale}.png"
                 save_image(log_img, img_save_path)
                 
@@ -221,8 +183,8 @@ def main():
                 images_list = []
                 for idx in selected_indices:
                     frame = trajectory[idx]
-                    # Unnormalize frame for visualization
-                    # frame = (frame + 1) / 2
+                    # Unnormalize frame for visualization [-1,1] to [0,1]
+                    frame = (frame + 1) / 2
                     frame = frame.clamp(0, 1)
                     images_list.append(
                         make_grid(frame, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
@@ -239,21 +201,6 @@ def main():
                     image_format="gif"
                 )
             model.train()
-
-            # Sample from EMA model
-            print(f"Sampling from EMA model at step {step} with cfg_scale {cfg_scale}...")
-            with torch.no_grad():
-                samples_ema, trajectory_ema = sampler_ema.sample_each_class(10, cfg_scale=cfg_scale, return_all_steps=True)
-                
-                log_img_ema = make_grid(samples_ema, nrow=10)
-                img_save_path_ema = f"/mnt/nvme/images/step{step}_cfg{cfg_scale}_ema.png"
-                save_image(log_img_ema, img_save_path_ema)
-                
-                experiment.log_image(
-                    img_save_path_ema,
-                    name=f"ema_cfg_{cfg_scale}",
-                    step=step
-                )
     
     losses = []
     sigma_min = 1e-06
@@ -267,16 +214,9 @@ def main():
             optimizer.zero_grad()
             
             # Get images and labels
-            x1 = data[0].to(device)  # Already in [0, 1]
+            x1 = data[0].to(device)  # Already in [-1, 1] due to normalization
             y = data[1].to(device)
             b = x1.shape[0]
-            print('x input and y class: ', x1.shape, y.shape)
-            # Convert to [-1, 1] for training
-            # x1 = x1 * 2 - 1
-            
-            # Sample timesteps with cosine schedule
-            # t = torch.randn([b, 1, 1, 1], device=device)
-            # t = 1 - torch.cos(t * 0.5 * torch.pi)
 
             t = timestep_scheduler.sample_timesteps(b, device)
             
@@ -312,11 +252,9 @@ def main():
                 # Standard noise sampling
                 z = torch.randn_like(x1)
             # Interpolate between noise and data
-            # x_t = (1 - (1 - sigma_min) * t) * z + t * x1
             x_t = sigma_t * z + alpha_t * x1
 
             # Target velocity
-            #u_positive = x1 - (1 - sigma_min) * z
             u_positive = timestep_scheduler.get_velocity_target(x1, z, t.squeeze(), sigma_min)
 
             # Create negative samples for contrastive loss
@@ -354,9 +292,6 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            # Update EMA
-            update_ema(model_ema, model, decay=ema_decay)
-
             # Logging
             losses.append(loss.item())
             pbar.set_postfix({"loss": loss.item(), "grad_norm": grad_norm.item()})
@@ -382,7 +317,7 @@ def main():
                     print(f"Running FID evaluation on {fid_subset_size} samples...")
                     with torch.autocast(device_type='cuda', dtype=torch.float32):
                         fid_score = fid_eval.fid_score()
-                    print(f"FID score with EMA at step {step}: {fid_score}")
+                    print(f"FID score at step {step}: {fid_score}")
                     experiment.log_metric("FID", fid_score, step=step)
                 except Exception as e:
                     print(f"FID evaluation failed: {e}")
@@ -391,13 +326,11 @@ def main():
                 checkpoint_path = os.path.join(checkpoint_root_path, f"step_{step}.pth")
                 state_dict = {
                     "model": model.state_dict(),
-                    "ema": model_ema.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": step,
                     "config": {
                         "image_size": image_size,
                         "image_channels": image_channels,
-                        "ema_decay": ema_decay,
                         "sigma_min": sigma_min,
                         "lambda_weight": lambda_weight,
                         "training_cfg_rate": training_cfg_rate,
@@ -414,11 +347,9 @@ def main():
     checkpoint_path = os.path.join(checkpoint_root_path, "model_direct_final.pth")
     state_dict = {
         "model": model.state_dict(),
-        "ema": model_ema.state_dict(),
         "config": {
             "image_size": image_size,
             "image_channels": image_channels,
-            "ema_decay": ema_decay,
             "sigma_min": sigma_min,
             "lambda_weight": lambda_weight,
             "training_cfg_rate": training_cfg_rate,
