@@ -8,7 +8,7 @@ from bitsandbytes.optim import AdamW8bit
 from copy import deepcopy
 from collections import OrderedDict
 
-from model import RectifiedFlow
+from model import RectifiedFlow, LogitNormalCosineScheduler
 from fid_evaluation import FIDEvaluation
 
 import moviepy.editor as mpy
@@ -16,6 +16,7 @@ from comet_ml import Experiment
 import os
 import torch.optim as optim
 import torch.nn.functional as F
+    
 
 
 # Clean EMA functions
@@ -38,7 +39,7 @@ def requires_grad(model, flag=True):
 def main():
     n_steps = 200000
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 128
+    batch_size = 64
     ema_decay = 0.9999
     
     # Direct image settings
@@ -90,13 +91,21 @@ def main():
         ]),
     )
 
+    # Initialize Logit-Normal + Cosine Scheduler (SD3 approach)
+    timestep_scheduler = LogitNormalCosineScheduler(
+        loc=0.0,        # SD3 default: symmetric around t=0.5
+        scale=1.0,      # SD3 default: moderate focus on intermediate timesteps
+        min_t=1e-8,     # Avoid singularities
+        max_t=1.0-1e-8  # Avoid singularities
+    )
+
     def cycle(iterable):
         while True:
             for i in iterable:
                 yield i
 
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=8
+        dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=40
     )
     train_dataloader = cycle(train_dataloader)
 
@@ -129,6 +138,11 @@ def main():
         channels=image_channels,
         image_size=image_size,
         num_classes=10,
+        use_logit_normal_cosine=True,
+        logit_normal_loc=0.0,
+        logit_normal_scale=1.0,
+        timestep_min=1e-8,
+        timestep_max=1.0-1e-8,
     )
     
     sampler_ema = RectifiedFlow(
@@ -137,6 +151,11 @@ def main():
         channels=image_channels,
         image_size=image_size,
         num_classes=10,
+        use_logit_normal_cosine=True,
+        logit_normal_loc=0.0,
+        logit_normal_scale=1.0,
+        timestep_min=1e-8,
+        timestep_max=1.0-1e-8,
     )
     
     scaler = torch.cuda.amp.GradScaler()
@@ -239,7 +258,7 @@ def main():
     losses = []
     sigma_min = 1e-06
     training_cfg_rate = 0.2
-    lambda_weight = 0.05
+    lambda_weight = 0.01
     use_immiscible = True
     with tqdm(range(n_steps), dynamic_ncols=True) as pbar:
         pbar.set_description("Training DiT Direct")
@@ -256,8 +275,18 @@ def main():
             x1 = x1 * 2 - 1
             
             # Sample timesteps with cosine schedule
-            t = torch.randn([b, 1, 1, 1], device=device)
-            t = 1 - torch.cos(t * 0.5 * torch.pi)
+            # t = torch.randn([b, 1, 1, 1], device=device)
+            # t = 1 - torch.cos(t * 0.5 * torch.pi)
+
+            t = timestep_scheduler.sample_timesteps(b, device)
+            
+            # Step 2: Get cosine-scheduled interpolation parameters
+            alpha_t, sigma_t = timestep_scheduler.get_cosine_schedule_params(t, sigma_min)
+
+            # Reshape for broadcasting
+            alpha_t = alpha_t.view(b, 1, 1, 1)
+            sigma_t = sigma_t.view(b, 1, 1, 1)
+            t = t.view(b, 1, 1, 1)
 
             # sample noise using immiscible training
             # Apply immiscible diffusion with KNN
@@ -279,22 +308,16 @@ def main():
                 batch_indices = torch.arange(b, device=x1.device)
                 z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
                 
-                # Alternative Method 2: Using gather (more complex but same result)
-                # max_indices needs shape [b, 1, 1, 1, 1] to gather from [b, k, c, h, w]
-                # z = torch.gather(
-                #     z_candidates,
-                #     1,  # gather along k dimension
-                #     max_indices.view(b, 1, 1, 1, 1).expand(b, 1, image_channels, image_size, image_size)
-                # ).squeeze(1)  # Remove k dimension
-                
             else:
                 # Standard noise sampling
                 z = torch.randn_like(x1)
             # Interpolate between noise and data
-            x_t = (1 - (1 - sigma_min) * t) * z + t * x1
+            # x_t = (1 - (1 - sigma_min) * t) * z + t * x1
+            x_t = sigma_t * z + alpha_t * x1
 
             # Target velocity
-            u_positive = x1 - (1 - sigma_min) * z
+            #u_positive = x1 - (1 - sigma_min) * z
+            u_positive = timestep_scheduler.get_velocity_target(x1, z, t.squeeze(), sigma_min)
 
             # Create negative samples for contrastive loss
             if b > 1:
@@ -323,15 +346,24 @@ def main():
                 loss = positive_loss - lambda_weight * negative_loss
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            # Calculate and clip gradient norm
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
-            
+
             # Update EMA
             update_ema(model_ema, model, decay=ema_decay)
 
+            # Logging
             losses.append(loss.item())
-            pbar.set_postfix({"loss": loss.item()})
+            pbar.set_postfix({"loss": loss.item(), "grad_norm": grad_norm.item()})
             experiment.log_metric("loss", loss.item(), step=step)
+            experiment.log_metric("grad_norm", grad_norm.item(), step=step)
+            experiment.log_metric("positive_loss", positive_loss.item(), step=step)
+            experiment.log_metric("negative_loss", negative_loss.item(), step=step)
 
             if step % 100 == 0:
                 avg_loss = sum(losses[-100:]) / min(100, len(losses))

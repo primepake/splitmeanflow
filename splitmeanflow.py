@@ -7,8 +7,8 @@ from dit import DiT
 import copy
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-# If using pack/unpack from einops
 from einops import pack, unpack
+from model import LogitNormalCosineScheduler  # Import from teacher's model
 
 
 def normalize_to_neg1_1(x):
@@ -99,8 +99,14 @@ class SplitMeanFlow(nn.Module):
         num_classes=10,
         flow_ratio=0.5,  # Fraction of boundary condition training
         cfg_scale=3.0,   # Fixed CFG scale for teacher
-        time_sampling="cosine",  # or "lognormal"
+        time_sampling="logit_normal_cosine",  # Match teacher
         sigma_min=1e-06,
+        use_immiscible=True,  # Add immiscible sampling option
+        # LogitNormal parameters to match teacher
+        logit_normal_loc=0.0,
+        logit_normal_scale=1.0,
+        timestep_min=1e-8,
+        timestep_max=1.0-1e-8,
     ):
         super().__init__()
         self.student = student_net
@@ -114,20 +120,63 @@ class SplitMeanFlow(nn.Module):
         self.cfg_scale = cfg_scale
         self.time_sampling = time_sampling
         self.sigma_min = sigma_min
+        self.use_immiscible = use_immiscible
+        
+        # Initialize the same scheduler as teacher if using logit-normal + cosine
+        if self.time_sampling == "logit_normal_cosine":
+            self.scheduler = LogitNormalCosineScheduler(
+                loc=logit_normal_loc,
+                scale=logit_normal_scale,
+                min_t=timestep_min,
+                max_t=timestep_max
+            )
+        else:
+            self.scheduler = None
         
         # Freeze teacher
         for param in self.teacher.parameters():
             param.requires_grad = False
         self.teacher.eval()
     
+    def sample_immiscible_noise(self, x, k=4):
+        """Sample noise using immiscible diffusion (farthest from data)"""
+        b, c, h, w = x.shape
+        z_candidates = torch.randn(b, k, c, h, w, device=x.device, dtype=x.dtype)
+        
+        x_flat = x.flatten(start_dim=1)  # [b, c*h*w]
+        z_candidates_flat = z_candidates.flatten(start_dim=2)  # [b, k, c*h*w]
+        
+        # Compute distances between each data point and its k noise candidates
+        distances = torch.norm(x_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
+        
+        # Find the farthest noise sample for each data point
+        max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+        
+        batch_indices = torch.arange(b, device=x.device)
+        z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+        return z
+    
     def sample_times(self, batch_size):
-        if self.time_sampling == "cosine":
+        """Sample r < t using the appropriate schedule"""
+        if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+            # Use logit-normal sampling like teacher
+            r = self.scheduler.sample_timesteps(batch_size, self.device)
+            t = self.scheduler.sample_timesteps(batch_size, self.device)
+            
+            # Ensure r < t
+            r_min = torch.minimum(r, t)
+            t_max = torch.maximum(r, t)
+            return r_min, t_max
+        elif self.time_sampling == "cosine":
+            # Simple cosine schedule
             times = torch.rand(batch_size, 2, device=self.device)
             times = 1 - torch.cos(times * 0.5 * torch.pi)
+            r, t = times.min(dim=1)[0], times.max(dim=1)[0]
         else:
+            # Uniform sampling
             times = torch.rand(batch_size, 2, device=self.device)
+            r, t = times.min(dim=1)[0], times.max(dim=1)[0]
         
-        r, t = times.min(dim=1)[0], times.max(dim=1)[0]
         # Ensure r < t (not just r <= t)
         mask = (r == t)
         t[mask] = torch.minimum(t[mask] + 0.01, torch.ones_like(t[mask]))
@@ -139,21 +188,37 @@ class SplitMeanFlow(nn.Module):
         """
         batch_size = x.shape[0]
         x = normalize_to_neg1_1(x)
-        sigma_min=self.sigma_min
+        
         # Decide whether to use boundary condition or interval splitting
         if torch.rand(1).item() < self.flow_ratio:
             # BOUNDARY CONDITION: u(z_t, t, t) = v(z_t, t)
-            t = torch.rand(batch_size, device=self.device)
-            if self.time_sampling == "cosine":
+            if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+                # Use the same sampling as teacher
+                t = self.scheduler.sample_timesteps(batch_size, self.device)
+                # Get cosine-scheduled interpolation parameters
+                alpha_t, sigma_t = self.scheduler.get_cosine_schedule_params(t, self.sigma_min)
+                alpha_t = alpha_t.view(batch_size, 1, 1, 1)
+                sigma_t = sigma_t.view(batch_size, 1, 1, 1)
+            elif self.time_sampling == "cosine":
+                t = torch.rand(batch_size, device=self.device)
                 t = 1 - torch.cos(t * 0.5 * torch.pi)
-            t_ = rearrange(t, "b -> b 1 1 1")
+                t_ = rearrange(t, "b -> b 1 1 1")
+                alpha_t = t_
+                sigma_t = 1 - (1 - self.sigma_min) * t_
+            else:
+                t = torch.rand(batch_size, device=self.device)
+                t_ = rearrange(t, "b -> b 1 1 1")
+                alpha_t = t_
+                sigma_t = 1 - (1 - self.sigma_min) * t_
             
+            # Sample noise
+            if self.use_immiscible:
+                z = self.sample_immiscible_noise(x)
+            else:
+                z = torch.randn_like(x)
             
-            # Create interpolated point
-            z = torch.randn_like(x)
-            # z_t = (1 - t_) * x + t_ * z
-            z_t = (1 - (1 - sigma_min) * t_) * z + t_ * x
-
+            # Interpolate using the same formula as teacher
+            z_t = sigma_t * z + alpha_t * x
             
             # Get teacher's velocity (with CFG if needed)
             with torch.no_grad():
@@ -167,6 +232,7 @@ class SplitMeanFlow(nn.Module):
             
             loss = F.mse_loss(u_pred, v_teacher)
             return loss, "boundary"
+            
         else:
             # INTERVAL SPLITTING CONSISTENCY
             # Sample r < t
@@ -176,18 +242,29 @@ class SplitMeanFlow(nn.Module):
             lam = torch.rand(batch_size, device=self.device)
             s = (1 - lam) * t + lam * r
             
-            # Create z_t
-            t_ = rearrange(t, "b -> b 1 1 1")
-            z = torch.randn_like(x)
-            # z_t = (1 - t_) * x + t_ * z
-            z_t = (1 - (1 - sigma_min) * t_) * z + t_ * x
-
+            # Get interpolation parameters for z_t
+            if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+                alpha_t, sigma_t = self.scheduler.get_cosine_schedule_params(t, self.sigma_min)
+                alpha_t = alpha_t.view(batch_size, 1, 1, 1)
+                sigma_t = sigma_t.view(batch_size, 1, 1, 1)
+            else:
+                t_ = rearrange(t, "b -> b 1 1 1")
+                alpha_t = t_
+                sigma_t = 1 - (1 - self.sigma_min) * t_
+            
+            # Sample noise
+            if self.use_immiscible:
+                z = self.sample_immiscible_noise(x)
+            else:
+                z = torch.randn_like(x)
+            
+            # Create z_t using the same interpolation as teacher
+            z_t = sigma_t * z + alpha_t * x
             
             # Forward pass 1: u(z_t, s, t)
             u2 = self.student(z_t, s, t, c)
             
             # Compute z_s using the predicted velocity
-            # t_s_diff = rearrange(t - s, "b -> b 1 1 1")
             t_s_diff = rearrange(t - s + 1e-8, "b -> b 1 1 1")  # Add small epsilon
             z_s = z_t - t_s_diff * u2
             
@@ -205,7 +282,7 @@ class SplitMeanFlow(nn.Module):
             loss = F.mse_loss(u_pred, target.detach())
 
             return loss, "consistency"
-            
+    
     @torch.no_grad()
     def sample_onestep(self, batch_size, c=None, cfg_scale=None):
         """One-step generation: z_0 = z_1 - u(z_1, 0, 1)"""
@@ -248,7 +325,13 @@ class SplitMeanFlow(nn.Module):
         r1_raw = torch.full((batch_size,), 0.5, device=self.device)
         t1_raw = torch.ones(batch_size, device=self.device)
         
-        if self.time_sampling == "cosine":
+        if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+            # For inference, use cosine schedule from scheduler
+            r1 = self.scheduler.create_cosine_schedule(2, self.device)[1]  # 0.5 point
+            t1 = self.scheduler.create_cosine_schedule(2, self.device)[2]  # 1.0 point
+            r1 = r1.expand(batch_size)
+            t1 = t1.expand(batch_size)
+        elif self.time_sampling == "cosine":
             r1 = 1 - torch.cos(r1_raw * 0.5 * torch.pi)
             t1 = 1 - torch.cos(t1_raw * 0.5 * torch.pi)
         else:
@@ -267,7 +350,12 @@ class SplitMeanFlow(nn.Module):
         r2_raw = torch.zeros(batch_size, device=self.device)
         t2_raw = torch.full((batch_size,), 0.5, device=self.device)
         
-        if self.time_sampling == "cosine":
+        if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+            r2 = self.scheduler.create_cosine_schedule(2, self.device)[0]  # 0.0 point
+            t2 = self.scheduler.create_cosine_schedule(2, self.device)[1]  # 0.5 point
+            r2 = r2.expand(batch_size)
+            t2 = t2.expand(batch_size)
+        elif self.time_sampling == "cosine":
             r2 = 1 - torch.cos(r2_raw * 0.5 * torch.pi)
             t2 = 1 - torch.cos(t2_raw * 0.5 * torch.pi)
         else:
@@ -300,12 +388,17 @@ class SplitMeanFlow(nn.Module):
             raise ValueError(f"Only 1 or 2 step sampling supported, got {num_steps}")
 
 
-# Helper function to create student from teacher
+
 def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
     """
     Create a SplitMeanFlow student model from a trained teacher DiT.
     """
-    # Create student with same architecture
+    # Check if teacher has register tokens
+    num_register_tokens = 0
+    if hasattr(teacher_dit, 'register_tokens') and teacher_dit.register_tokens is not None:
+        num_register_tokens = teacher_dit.register_tokens.shape[0]
+    
+   
     student = SplitMeanFlowDiT(
         input_size=teacher_dit.x_embedder.img_size[0],
         patch_size=teacher_dit.patch_size,
@@ -313,7 +406,7 @@ def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
         dim=teacher_dit.t_embedder.mlp[-1].out_features,
         depth=len(teacher_dit.blocks),
         num_heads=teacher_dit.num_heads,
-        num_register_tokens=teacher_dit.register_tokens.shape[0],
+        num_register_tokens=num_register_tokens,
         class_dropout_prob=0.0,  # No dropout for student!
         num_classes=teacher_dit.num_classes,
         learn_sigma=teacher_dit.learn_sigma,

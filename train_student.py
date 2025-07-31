@@ -182,7 +182,7 @@ def main():
             # Sample from regular model
             student_net.eval()
             with torch.no_grad():
-                samples, = splitmeanflow.sample_each_class(
+                samples = splitmeanflow.sample_each_class(
                     n_per_class=10,
                     num_steps=num_steps,
                     cfg_scale=None  # No CFG at inference
@@ -239,6 +239,8 @@ def main():
                 loss, loss_type = splitmeanflow(x1, y)
             
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(student_net.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
