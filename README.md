@@ -1,6 +1,5 @@
 # SplitMeanFlow - Unofficial Implementation
 
-![SplitMeanFlow CIFAR10 Samples](assets/step199999_cfg5.0_ema.png)
 
 This is an **unofficial implementation** of SplitMeanFlow from the paper **"SplitMeanFlow: Interval Splitting Consistency in Few-Step Generative Modeling"** by ByteDance. [[arxiv](https://arxiv.org/abs/2507.16884)]. This implementation is based on my understanding of the paper and uses the DiT architecture as the backbone.
 
