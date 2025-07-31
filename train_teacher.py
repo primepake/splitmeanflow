@@ -222,7 +222,7 @@ def main():
                 for idx in selected_indices:
                     frame = trajectory[idx]
                     # Unnormalize frame for visualization
-                    frame = (frame + 1) / 2
+                    # frame = (frame + 1) / 2
                     frame = frame.clamp(0, 1)
                     images_list.append(
                         make_grid(frame, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
@@ -349,7 +349,7 @@ def main():
             scaler.unscale_(optimizer)
 
             # Calculate and clip gradient norm
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
 
             scaler.step(optimizer)
             scaler.update()

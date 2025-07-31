@@ -147,12 +147,35 @@ class RectifiedFlow(nn.Module):
             return torch.linspace(0, 1, sample_steps + 1, device=self.device)
     
     @torch.no_grad()
-    def sample(self, batch_size, cfg_scale=5.0, sample_steps=10, return_all_steps=False):
-        """Sample images using configured scheduling."""
-        if self.use_cond:
+    def sample(self, batch_size=None, class_labels=None, cfg_scale=5.0, sample_steps=10, return_all_steps=False):
+        """
+        Sample images using configured scheduling.
+        
+        Args:
+            batch_size: Number of samples to generate (required if class_labels is None)
+            class_labels: Tensor of class labels to condition on (optional)
+            cfg_scale: Classifier-free guidance scale
+            sample_steps: Number of sampling steps
+            return_all_steps: Whether to return all intermediate steps
+        
+        Returns:
+            Generated samples in [0, 1] range
+        """
+        # Determine batch size and conditioning
+        if class_labels is not None:
+            # Use provided class labels
+            batch_size = class_labels.shape[0]
+            c = class_labels.to(self.device)
+        elif self.use_cond and batch_size is not None:
+            # Generate random class labels
             c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
-        else:
+        elif batch_size is not None:
+            # No conditioning
             c = None
+        else:
+            raise ValueError("Either batch_size or class_labels must be provided")
+        
+        print('class labels: ', c)
         
         z = torch.randn((batch_size, self.channels, self.image_size, self.image_size), device=self.device)
         
@@ -166,7 +189,8 @@ class RectifiedFlow(nn.Module):
         dt = t_span[1] - t_span[0]
 
         for step in range(1, len(t_span)):
-            if self.use_cond:
+            if self.use_cond and c is not None:
+                print(f"sample using cfg_scale: {cfg_scale}")
                 v_t = self.net.forward_with_cfg(z, t, c, cfg_scale)
             else:
                 v_t = self.net(z, t)
@@ -183,7 +207,8 @@ class RectifiedFlow(nn.Module):
                 dt = t_span[step + 1] - t
         
         z_final = unnormalize_to_0_1(z.clip(-1, 1))
-    
+        # z_final = z.clip(-1, 1)
+
         if return_all_steps:
             # Return both final image and full trajectory
             return z_final, torch.stack(images)  # Keep trajectory in [-1, 1] for GIF creation
@@ -197,6 +222,7 @@ class RectifiedFlow(nn.Module):
             raise ValueError("Cannot sample each class when num_classes is None")
         
         c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
+        print('class: ', c)
         z = torch.randn(self.num_classes * n_per_class, self.channels, self.image_size, self.image_size, device=self.device)
         
         # FIXED: Consistent trajectory tracking
@@ -208,6 +234,7 @@ class RectifiedFlow(nn.Module):
 
         for step in range(1, len(t_span)):
             if self.use_cond:
+                print(f"Using cfg_scale: {cfg_scale}")
                 v_t = self.net.forward_with_cfg(z, t, c, cfg_scale)
             else:
                 v_t = self.net(z, t)
@@ -224,6 +251,7 @@ class RectifiedFlow(nn.Module):
                 dt = t_span[step + 1] - t
         
         z_final = unnormalize_to_0_1(z.clip(-1, 1))
+        # z_final = z.clip(-1, 1)
     
         if return_all_steps:
             # Return both final image and full trajectory
