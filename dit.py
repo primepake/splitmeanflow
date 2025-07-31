@@ -231,7 +231,8 @@ class DiT(nn.Module):
         c = t
         if self.use_cond:
             y = self.y_embedder(y, self.training)    # (N, D)
-        c = c + y                                # (N, D)
+            c = c + y
+                                       # (N, D)
         for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             

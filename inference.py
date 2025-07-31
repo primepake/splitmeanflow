@@ -1,9 +1,8 @@
 import torch
 import torch.nn.functional as F
 from torchvision.utils import make_grid, save_image
-from diffusers.models import AutoencoderKL
 from dit import DiT
-from model import RectifiedFlowVAE as RectifiedFlow
+from model import RectifiedFlow
 import os
 import argparse
 from tqdm import tqdm
@@ -11,8 +10,8 @@ import numpy as np
 from PIL import Image
 
 
-class DiTVAEInference:
-    def __init__(self, checkpoint_path, device='cuda', vae_model='ema'):
+class DiTInference:
+    def __init__(self, checkpoint_path, device='cuda'):
         self.device = device
         
         # Load checkpoint
@@ -21,23 +20,16 @@ class DiTVAEInference:
         
         # Extract config
         config = checkpoint.get('config', {})
-        self.vae_model = config.get('vae_model', vae_model)
-        self.image_size = config.get('image_size', 256)
-        self.latent_size = config.get('latent_size', 32)
-        self.latent_channels = config.get('latent_channels', 4)
-        
-        # Load VAE
-        print(f"Loading VAE model (sd-vae-ft-{self.vae_model})...")
-        self.vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{self.vae_model}").to(device)
-        self.vae.eval()
-        self.vae.requires_grad_(False)
+        self.image_size = config.get('image_size', 64)
+        self.image_channels = config.get('image_channels', 3)
+        self.sigma_min = config.get('sigma_min', 1e-6)
         
         # Initialize DiT model
         print("Initializing DiT model...")
         self.model = DiT(
-            input_size=self.latent_size,
+            input_size=self.image_size,
             patch_size=2,
-            in_channels=self.latent_channels,
+            in_channels=self.image_channels,
             dim=384,
             depth=12,
             num_heads=6,
@@ -56,30 +48,25 @@ class DiTVAEInference:
         
         self.model.eval()
         
-        # Initialize sampler
+        # Initialize sampler with scheduler parameters from checkpoint
         self.sampler = RectifiedFlow(
             self.model,
             device=device,
-            channels=self.latent_channels,
-            image_size=self.latent_size,
+            channels=self.image_channels,
+            image_size=self.image_size,
             num_classes=10,
+            use_logit_normal_cosine=config.get('timestep_sampling', 'logit_normal_cosine') == 'logit_normal_cosine',
+            logit_normal_loc=config.get('logit_normal_loc', 0.0),
+            logit_normal_scale=config.get('logit_normal_scale', 1.0),
+            timestep_min=config.get('timestep_min', 1e-8),
+            timestep_max=config.get('timestep_max', 1.0-1e-8),
         )
         
         print("Model loaded successfully!")
     
     @torch.no_grad()
-    def decode_latents(self, latents):
-        """Decode latents to images using VAE"""
-        # Denormalize latents
-        latents = latents / 0.18215
-        images = self.vae.decode(latents).sample
-        # Convert from [-1, 1] to [0, 1]
-        images = (images + 1) / 2
-        return images.clamp(0, 1)
-    
-    @torch.no_grad()
     def sample(self, num_samples=16, class_labels=None, cfg_scale=3.0, 
-               num_steps=50, seed=None, return_latents=False):
+               num_steps=50, seed=None):
         """
         Sample images from the model.
         
@@ -89,16 +76,14 @@ class DiTVAEInference:
             cfg_scale: Classifier-free guidance scale
             num_steps: Number of sampling steps
             seed: Random seed for reproducibility
-            return_latents: If True, return latents instead of decoded images
         
         Returns:
-            Generated images tensor (or latents if return_latents=True)
+            Generated images tensor in [0, 1]
         """
         if seed is not None:
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)
         
-        # Sample latents using RectifiedFlow's sample method
         print(f"Sampling {num_samples} images with CFG scale {cfg_scale}...")
         
         if class_labels is not None:
@@ -115,18 +100,12 @@ class DiTVAEInference:
                 class_labels = class_labels.repeat(num_samples // len(class_labels) + 1)[:num_samples]
         
         # Use the sampler's method
-        latents = self.sampler.sample(
+        images = self.sampler.sample(
             batch_size=num_samples,
-            y=class_labels,  # Pass None for random
             cfg_scale=cfg_scale,
             sample_steps=num_steps
         )
         
-        if return_latents:
-            return latents
-        
-        # Decode to images
-        images = self.decode_latents(latents)
         return images
     
     @torch.no_grad()
@@ -137,16 +116,13 @@ class DiTVAEInference:
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)
         
-        # Use the sampler's built-in sample_each_class method
         print(f"Sampling all classes with {samples_per_class} samples per class...")
-        latents = self.sampler.sample_each_class(
+        images = self.sampler.sample_each_class(
             n_per_class=samples_per_class,
             cfg_scale=cfg_scale,
             sample_steps=num_steps
         )
         
-        # Decode to images
-        images = self.decode_latents(latents)
         return images
     
     @torch.no_grad()
@@ -168,46 +144,29 @@ class DiTVAEInference:
         return grid
     
     @torch.no_grad()
-    def interpolate_classes(self, class1, class2, num_steps=10, 
-                           cfg_scale=3.0, sampling_steps=50, seed=None):
-        """Interpolate between two classes in latent space"""
+    def sample_trajectory(self, num_samples=4, class_labels=None, cfg_scale=3.0,
+                         num_steps=50, seed=None):
+        """Sample images and return the full trajectory for visualization"""
         if seed is not None:
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)
         
-        # For DiT with discrete classes, we'll create a smooth transition
-        # by gradually changing the class conditioning
-        interpolated_images = []
+        print(f"Sampling {num_samples} trajectories with CFG scale {cfg_scale}...")
         
-        # Sample with fixed initial noise
-        z_init = torch.randn(1, self.latent_channels, self.latent_size, 
-                            self.latent_size, device=self.device)
+        if class_labels is None:
+            class_labels = torch.randint(0, 10, (num_samples,), device=self.device)
+        elif isinstance(class_labels, int):
+            class_labels = torch.full((num_samples,), class_labels, device=self.device)
         
-        for i in range(num_steps):
-            alpha = i / (num_steps - 1)
-            
-            # Use the same initial noise for consistency
-            z = z_init.clone()
-            
-            # Determine which class to use (can be extended to class mixing)
-            if alpha < 0.5:
-                current_class = torch.tensor([class1], device=self.device)
-            else:
-                current_class = torch.tensor([class2], device=self.device)
-            
-            # Sample with fixed noise
-            t_span = torch.linspace(0, 1, sampling_steps, device=self.device)
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-            
-            for t in reversed(t_span):
-                v_t = self.model.forward_with_cfg(z, t, current_class, cfg_scale)
-                z = z - v_t / sampling_steps
-            
-            # Decode the latent
-            image = self.decode_latents(z)
-            interpolated_images.append(image)
+        # Get samples with trajectory
+        final_images, trajectory = self.sampler.sample(
+            batch_size=num_samples,
+            cfg_scale=cfg_scale,
+            sample_steps=num_steps,
+            return_all_steps=True
+        )
         
-        return torch.cat(interpolated_images, dim=0)
+        return final_images, trajectory
     
     def save_samples(self, output_dir='outputs', num_samples=64, 
                     cfg_scale=3.0, seed=42):
@@ -224,9 +183,9 @@ class DiTVAEInference:
         grid = make_grid(class_grid, nrow=10, normalize=False)
         save_image(grid, os.path.join(output_dir, f'class_grid_cfg{cfg_scale}.png'))
         
-        # Random samples
+        # Random samples with different CFG scales
         print("Generating random samples...")
-        for cfg in [1.0, 2.0, 3.0, 5.0]:
+        for cfg in [1.0, 2.0, 3.0, 5.0, 7.0]:
             random_grid = self.sample_grid(
                 rows=8, 
                 cols=8, 
@@ -235,12 +194,33 @@ class DiTVAEInference:
             )
             save_image(random_grid, os.path.join(output_dir, f'random_grid_cfg{cfg}.png'))
         
+        # Generate trajectory visualization
+        print("Generating trajectory visualization...")
+        final_images, trajectory = self.sample_trajectory(
+            num_samples=16,
+            cfg_scale=cfg_scale,
+            num_steps=50,
+            seed=seed
+        )
+        
+        # Save a few frames from the trajectory
+        trajectory_indices = [0, len(trajectory)//4, len(trajectory)//2, 3*len(trajectory)//4, -1]
+        trajectory_frames = []
+        for idx in trajectory_indices:
+            frame = trajectory[idx]
+            frame = (frame + 1) / 2  # Convert from [-1, 1] to [0, 1]
+            frame = frame.clamp(0, 1)
+            trajectory_frames.append(frame)
+        
+        trajectory_grid = make_grid(torch.cat(trajectory_frames, dim=0), nrow=len(trajectory_indices), normalize=False)
+        save_image(trajectory_grid, os.path.join(output_dir, 'trajectory_visualization.png'))
+        
         print(f"Samples saved to {output_dir}/")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='DiT VAE Inference')
-    parser.add_argument('--checkpoint', type=str, required=False, default='/mnt/nvme/checkpoint/dit_vae/step_0.pth',
+    parser = argparse.ArgumentParser(description='DiT Direct Image Inference')
+    parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--output_dir', type=str, default='./outputs',
                        help='Directory to save outputs')
@@ -261,13 +241,13 @@ def main():
     
     # Action
     parser.add_argument('--action', type=str, default='sample',
-                       choices=['sample', 'grid', 'all_classes', 'interpolate'],
+                       choices=['sample', 'grid', 'all_classes', 'trajectory', 'all'],
                        help='What to generate')
     
     args = parser.parse_args()
     
     # Initialize model
-    model = DiTVAEInference(args.checkpoint, device=args.device)
+    model = DiTInference(args.checkpoint, device=args.device)
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -315,25 +295,33 @@ def main():
         grid = make_grid(images, nrow=10, normalize=False)
         save_image(grid, os.path.join(args.output_dir, 'all_classes.png'))
         
-    elif args.action == 'interpolate':
-        # Interpolate between classes
-        if args.class_label is None:
-            class1, class2 = 0, 9  # Default: interpolate between first and last class
-        else:
-            class1 = args.class_label
-            class2 = (args.class_label + 1) % 10
-        
-        images = model.interpolate_classes(
-            class1, class2,
-            num_steps=10,
+    elif args.action == 'trajectory':
+        # Generate trajectory visualization
+        final_images, trajectory = model.sample_trajectory(
+            num_samples=16,
+            class_labels=args.class_label,
             cfg_scale=args.cfg_scale,
-            sampling_steps=args.num_steps,
+            num_steps=args.num_steps,
             seed=args.seed
         )
-        grid = make_grid(images, nrow=10, normalize=False)
-        save_image(grid, os.path.join(args.output_dir, f'interpolate_{class1}_to_{class2}.png'))
+        
+        # Save final images
+        grid = make_grid(final_images, nrow=4, normalize=False)
+        save_image(grid, os.path.join(args.output_dir, 'trajectory_final.png'))
+        
+        # Save trajectory frames
+        for i, frame_idx in enumerate([0, len(trajectory)//4, len(trajectory)//2, 3*len(trajectory)//4, -1]):
+            frame = trajectory[frame_idx]
+            frame = (frame + 1) / 2  # Convert from [-1, 1] to [0, 1]
+            frame = frame.clamp(0, 1)
+            frame_grid = make_grid(frame, nrow=4, normalize=False)
+            save_image(frame_grid, os.path.join(args.output_dir, f'trajectory_frame_{i}.png'))
     
-    print(f"Generated images saved to {args.output_dir}/")
+    elif args.action == 'all':
+        # Generate all visualizations
+        model.save_samples(args.output_dir, num_samples=64, cfg_scale=args.cfg_scale, seed=args.seed)
+    
+    print(f"\nGenerated images saved to {args.output_dir}/")
 
 
 if __name__ == "__main__":
