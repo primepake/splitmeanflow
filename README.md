@@ -18,34 +18,22 @@ conda env create -f environment.yml
 conda activate splitmeanflow
 ```
 
-## Implementation Status
-
-✅ **Implemented:**
-- Interval Splitting Consistency loss
-- Two-stage training (Teacher + Student)
-- DiT backbone with interval time conditioning
-- Basic sampling (1-step and 2-step)
-- CIFAR-10 training
-
-🚧 **Work in Progress:**
-- EMA weights
-- Multi-GPU training
-- Other datasets (ImageNet, CelebA)
-- Comprehensive evaluation metrics
-
-❌ **Not Implemented Yet:**
-- Audio generation experiments
-- Advanced time sampling strategies
-- Full ablation studies
 
 ## Training
 
 ### Stage 1: Teacher Model
 First, train a standard flow matching teacher:
 ```bash
-python train_teacher.py
+python train_teacher_mnist.py
 ```
 
+Samples in training:
+
+![Samples](assets/trajectory_cfg_5-99999.gif)
+
+The training log here: ![training log comet](assets/mnist_log.png)
+
+You can download the teacher model at [model](https://github.com/primepake/splitmeanflow/releases/tag/mnist)
 ### Stage 2: Student Model  
 Then train the SplitMeanFlow student:
 ```bash
