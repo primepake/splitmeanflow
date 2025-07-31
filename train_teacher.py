@@ -226,7 +226,7 @@ def main():
             # Reshape for broadcasting
             alpha_t = alpha_t.view(b, 1, 1, 1)
             sigma_t = sigma_t.view(b, 1, 1, 1)
-            t = t.view(b, 1, 1, 1)
+            # t = t.view(b, 1, 1, 1)
 
             # sample noise using immiscible training
             # Apply immiscible diffusion with KNN
@@ -255,7 +255,7 @@ def main():
             x_t = sigma_t * z + alpha_t * x1
 
             # Target velocity
-            u_positive = timestep_scheduler.get_velocity_target(x1, z, t.squeeze(), sigma_min)
+            u_positive = timestep_scheduler.get_velocity_target(x1, z, sigma_min)
 
             # Create negative samples for contrastive loss
             if b > 1:

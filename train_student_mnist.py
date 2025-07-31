@@ -42,21 +42,20 @@ def main():
     # Training configuration
     n_steps = 500000  # Reduced for MNIST
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 256  # Larger batch size for MNIST
+    batch_size = 256
     ema_decay = 0.9999
     
-    # MNIST settings
-    image_size = 28  # MNIST native size
-    image_channels = 1  # MNIST is grayscale
-    num_classes = 10  # 10 digits
+    image_size = 28  
+    image_channels = 1
+    num_classes = 10
     
-    # SplitMeanFlow specific configs
-    flow_ratio = 0.7  # Higher for stability as paper suggests
-    teacher_cfg_scale = 5.0  # Fixed CFG scale for teacher guidance
-    time_sampling = "logit_normal_cosine"  # Match teacher
-    sigma_min = 1e-06  # Match teacher
+   
+    flow_ratio = 0.7
+    teacher_cfg_scale = 5.0
+    time_sampling = "logit_normal_cosine" 
+    sigma_min = 1e-06  
     
-    # Paths - Update to your MNIST teacher checkpoint
+   
     teacher_checkpoint_path = "./mnist_teacher_step_99999.pth"
     checkpoint_root_path = '/mnt/nvme/checkpoint/splitmeanflow_mnist/'
     os.makedirs(checkpoint_root_path, exist_ok=True)
@@ -65,7 +64,6 @@ def main():
     resume_from_checkpoint = False
     resume_checkpoint_path = "/mnt/nvme/checkpoint/splitmeanflow_mnist/step_49999.pth"
     
-    # Initialize Comet ML experiment
     experiment = Experiment(
         project_name="splitmeanflow-student-mnist",
     )
@@ -135,20 +133,20 @@ def main():
         class_dropout_prob=0.1,
     ).to(device)
     
-    # Load teacher checkpoint
+   
     checkpoint = torch.load(teacher_checkpoint_path, map_location=device)
   
     teacher_dit.load_state_dict(checkpoint['model'])
     print("Loaded teacher model weights")
     
-    # Create teacher RectifiedFlow wrapper
+   
     teacher_model = RectifiedFlow(
         net=teacher_dit,
         device=device,
         channels=image_channels,
         image_size=image_size,
         num_classes=num_classes,
-        use_logit_normal_cosine=True,  # Match teacher training
+        use_logit_normal_cosine=True,
         logit_normal_loc=0.0,
         logit_normal_scale=1.0,
         timestep_min=1e-8,
