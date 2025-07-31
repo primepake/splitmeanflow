@@ -42,7 +42,7 @@ def main():
     ema_decay = 0.9999
     
     # Direct image settings
-    image_size = 32  # Smaller image size for direct generation
+    image_size = 16  # Smaller image size for direct generation
     image_channels = 3  # RGB channels
     
     # Create directories
@@ -251,7 +251,7 @@ def main():
             x1 = data[0].to(device)  # Already in [0, 1]
             y = data[1].to(device)
             b = x1.shape[0]
-            
+            print('x input and y class: ', x1.shape, y.shape)
             # Convert to [-1, 1] for training
             x1 = x1 * 2 - 1
             
@@ -265,24 +265,30 @@ def main():
                 k = 4
                 # Generate k noise samples for each data point
                 z_candidates = torch.randn(b, k, image_channels, image_size, image_size, device=x1.device, dtype=x1.dtype)
-            
-                x1_flat = x1.flatten(start_dim=1).to(torch.float16)
-                z_candidates_flat = z_candidates.flatten(start_dim=2).to(torch.float16)
                 
-            
-                distances = torch.norm(x1_flat.unsqueeze(1) - z_candidates_flat, dim=2)
-            
-                min_distances, min_indices = torch.min(distances, dim=1)
+                x1_flat = x1.flatten(start_dim=1)  # [b, c*h*w]
+                z_candidates_flat = z_candidates.flatten(start_dim=2)  # [b, k, c*h*w]
                 
-            
-                z = torch.gather(
-                    z_candidates, 
-                    1, 
-                    min_indices.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, 1, image_channels, image_size, image_size)
-                )[:, 0, :, :]
+                # Compute distances between each data point and its k noise candidates
+                distances = torch.norm(x1_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
                 
-            else:         
-                # sample noise p(x_0)
+                # Find the farthest noise sample for each data point (for immiscible)
+                max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+                
+                # Method 1: Using gather with proper indexing
+                batch_indices = torch.arange(b, device=x1.device)
+                z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+                
+                # Alternative Method 2: Using gather (more complex but same result)
+                # max_indices needs shape [b, 1, 1, 1, 1] to gather from [b, k, c, h, w]
+                # z = torch.gather(
+                #     z_candidates,
+                #     1,  # gather along k dimension
+                #     max_indices.view(b, 1, 1, 1, 1).expand(b, 1, image_channels, image_size, image_size)
+                # ).squeeze(1)  # Remove k dimension
+                
+            else:
+                # Standard noise sampling
                 z = torch.randn_like(x1)
             # Interpolate between noise and data
             x_t = (1 - (1 - sigma_min) * t) * z + t * x1

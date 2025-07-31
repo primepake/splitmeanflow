@@ -2,10 +2,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from functools import partial
-from einops import rearrange
 from tqdm.auto import tqdm
 from dit import DiT
 import copy
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+# If using pack/unpack from einops
+from einops import pack, unpack
 
 
 def normalize_to_neg1_1(x):
@@ -92,11 +95,12 @@ class SplitMeanFlow(nn.Module):
         teacher_model: nn.Module,  # This is RectifiedFlow which contains teacher.net
         device="cuda",
         channels=3,
-        image_size=32,
+        image_size=16,
         num_classes=10,
         flow_ratio=0.5,  # Fraction of boundary condition training
         cfg_scale=3.0,   # Fixed CFG scale for teacher
-        time_sampling="uniform",  # or "lognormal"
+        time_sampling="cosine",  # or "lognormal"
+        sigma_min=1e-06,
     ):
         super().__init__()
         self.student = student_net
@@ -109,6 +113,7 @@ class SplitMeanFlow(nn.Module):
         self.flow_ratio = flow_ratio
         self.cfg_scale = cfg_scale
         self.time_sampling = time_sampling
+        self.sigma_min = sigma_min
         
         # Freeze teacher
         for param in self.teacher.parameters():
@@ -116,15 +121,16 @@ class SplitMeanFlow(nn.Module):
         self.teacher.eval()
     
     def sample_times(self, batch_size):
-        """Sample r < t, with optional importance sampling"""
-        if self.time_sampling == "lognormal":
-            # Sample from log-normal distribution
-            times = torch.randn(batch_size, 2, device=self.device).sigmoid()
+        if self.time_sampling == "cosine":
+            times = torch.rand(batch_size, 2, device=self.device)
+            times = 1 - torch.cos(times * 0.5 * torch.pi)
         else:
-            # Uniform sampling
             times = torch.rand(batch_size, 2, device=self.device)
         
         r, t = times.min(dim=1)[0], times.max(dim=1)[0]
+        # Ensure r < t (not just r <= t)
+        mask = (r == t)
+        t[mask] = torch.minimum(t[mask] + 0.01, torch.ones_like(t[mask]))
         return r, t
     
     def forward(self, x, c=None):
@@ -133,16 +139,21 @@ class SplitMeanFlow(nn.Module):
         """
         batch_size = x.shape[0]
         x = normalize_to_neg1_1(x)
-        
+        sigma_min=self.sigma_min
         # Decide whether to use boundary condition or interval splitting
         if torch.rand(1).item() < self.flow_ratio:
             # BOUNDARY CONDITION: u(z_t, t, t) = v(z_t, t)
             t = torch.rand(batch_size, device=self.device)
+            if self.time_sampling == "cosine":
+                t = 1 - torch.cos(t * 0.5 * torch.pi)
             t_ = rearrange(t, "b -> b 1 1 1")
+            
             
             # Create interpolated point
             z = torch.randn_like(x)
-            z_t = (1 - t_) * x + t_ * z
+            # z_t = (1 - t_) * x + t_ * z
+            z_t = (1 - (1 - sigma_min) * t_) * z + t_ * x
+
             
             # Get teacher's velocity (with CFG if needed)
             with torch.no_grad():
@@ -155,7 +166,7 @@ class SplitMeanFlow(nn.Module):
             u_pred = self.student(z_t, t, t, c)  # r = t
             
             loss = F.mse_loss(u_pred, v_teacher)
-            
+            return loss, "boundary"
         else:
             # INTERVAL SPLITTING CONSISTENCY
             # Sample r < t
@@ -168,13 +179,16 @@ class SplitMeanFlow(nn.Module):
             # Create z_t
             t_ = rearrange(t, "b -> b 1 1 1")
             z = torch.randn_like(x)
-            z_t = (1 - t_) * x + t_ * z
+            # z_t = (1 - t_) * x + t_ * z
+            z_t = (1 - (1 - sigma_min) * t_) * z + t_ * x
+
             
             # Forward pass 1: u(z_t, s, t)
             u2 = self.student(z_t, s, t, c)
             
             # Compute z_s using the predicted velocity
-            t_s_diff = rearrange(t - s, "b -> b 1 1 1")
+            # t_s_diff = rearrange(t - s, "b -> b 1 1 1")
+            t_s_diff = rearrange(t - s + 1e-8, "b -> b 1 1 1")  # Add small epsilon
             z_s = z_t - t_s_diff * u2
             
             # Forward pass 2: u(z_s, r, s)
@@ -189,9 +203,9 @@ class SplitMeanFlow(nn.Module):
             
             # Loss with stop gradient on target
             loss = F.mse_loss(u_pred, target.detach())
-        
-        return loss
-    
+
+            return loss, "consistency"
+            
     @torch.no_grad()
     def sample_onestep(self, batch_size, c=None, cfg_scale=None):
         """One-step generation: z_0 = z_1 - u(z_1, 0, 1)"""
@@ -230,26 +244,43 @@ class SplitMeanFlow(nn.Module):
             c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
         
         # Step 1: z_1 -> z_0.5
-        r1 = torch.full((batch_size,), 0.5, device=self.device)
-        t1 = torch.ones(batch_size, device=self.device)
+        # Keep track of both raw and transformed times
+        r1_raw = torch.full((batch_size,), 0.5, device=self.device)
+        t1_raw = torch.ones(batch_size, device=self.device)
+        
+        if self.time_sampling == "cosine":
+            r1 = 1 - torch.cos(r1_raw * 0.5 * torch.pi)
+            t1 = 1 - torch.cos(t1_raw * 0.5 * torch.pi)
+        else:
+            r1 = r1_raw
+            t1 = t1_raw
         
         if cfg_scale is not None and cfg_scale > 0:
             u1 = self.student.forward_with_cfg(z_1, r1, t1, c, cfg_scale)
         else:
             u1 = self.student(z_1, r1, t1, c)
         
-        z_05 = z_1 - 0.5 * u1
+        # Use raw time difference for the step
+        z_05 = z_1 - (t1_raw - r1_raw).view(-1, 1, 1, 1) * u1
         
         # Step 2: z_0.5 -> z_0
-        r2 = torch.zeros(batch_size, device=self.device)
-        t2 = torch.full((batch_size,), 0.5, device=self.device)
+        r2_raw = torch.zeros(batch_size, device=self.device)
+        t2_raw = torch.full((batch_size,), 0.5, device=self.device)
+        
+        if self.time_sampling == "cosine":
+            r2 = 1 - torch.cos(r2_raw * 0.5 * torch.pi)
+            t2 = 1 - torch.cos(t2_raw * 0.5 * torch.pi)
+        else:
+            r2 = r2_raw
+            t2 = t2_raw
         
         if cfg_scale is not None and cfg_scale > 0:
             u2 = self.student.forward_with_cfg(z_05, r2, t2, c, cfg_scale)
         else:
             u2 = self.student(z_05, r2, t2, c)
         
-        z_0 = z_05 - 0.5 * u2
+        # Use raw time difference for the step
+        z_0 = z_05 - (t2_raw - r2_raw).view(-1, 1, 1, 1) * u2
         
         # Denormalize to [0, 1]
         z_0 = unnormalize_to_0_1(z_0.clamp(-1, 1))
