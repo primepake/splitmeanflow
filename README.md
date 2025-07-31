@@ -94,15 +94,6 @@ class SplitMeanFlowDiT(nn.Module):
 
 **Disclaimer: These are preliminary results from my implementation and may not match the paper's performance.**
 
-### CIFAR-10 (200k steps)
-- 1-step generation: FID ~8.5 (paper reports ~3.6)
-- 2-step generation: FID ~6.2
-- Training time: ~18 hours on single RTX 3090
-
-The gap in performance could be due to:
-- Implementation differences
-- Hyperparameter tuning
-- Missing components
 
 ## Known Issues & Differences from Paper
 
