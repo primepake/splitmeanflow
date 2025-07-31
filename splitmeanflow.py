@@ -34,6 +34,12 @@ class SplitMeanFlowDiT(DiT):
             nn.SiLU(),
             nn.Linear(dim, dim)
         )
+        
+        # Initialize to near-zero for stability
+        nn.init.normal_(self.interval_embedder[0].weight, std=0.02)
+        nn.init.zeros_(self.interval_embedder[0].bias)
+        nn.init.zeros_(self.interval_embedder[2].weight)
+        nn.init.zeros_(self.interval_embedder[2].bias)
     
     def forward(self, x, r, t, y):
         """
@@ -46,9 +52,10 @@ class SplitMeanFlowDiT(DiT):
         H, W = x.shape[-2:]
         x_emb = self.x_embedder(x) + self.pos_embed
         
-        # Pack with register tokens
-        r_tokens = repeat(self.register_tokens, 'n d -> b n d', b=x_emb.shape[0])
-        x_emb, ps = pack([x_emb, r_tokens], 'b * d ')
+        # Pack with register tokens if they exist
+        if hasattr(self, 'register_tokens') and self.register_tokens is not None:
+            r_tokens = repeat(self.register_tokens, 'n d -> b n d', b=x_emb.shape[0])
+            x_emb, ps = pack([x_emb, r_tokens], 'b * d ')
         
         # Time embeddings
         t_emb = self.t_embedder(t)
@@ -68,7 +75,9 @@ class SplitMeanFlowDiT(DiT):
             x_emb = block(x_emb, c)
         
         # Unpack and final layer
-        x_emb, _ = unpack(x_emb, ps, 'b * d')
+        if hasattr(self, 'register_tokens') and self.register_tokens is not None:
+            x_emb, _ = unpack(x_emb, ps, 'b * d')
+            
         x_out = self.final_layer(x_emb, c)
         x_out = self.unpatchify(x_out)
         
@@ -185,9 +194,9 @@ class SplitMeanFlow(nn.Module):
     def forward(self, x, c=None):
         """
         Training forward pass implementing Algorithm 1 from SplitMeanFlow paper.
+        x is assumed to be in [-1, 1] already from dataloader
         """
         batch_size = x.shape[0]
-        x = normalize_to_neg1_1(x)
         
         # Decide whether to use boundary condition or interval splitting
         if torch.rand(1).item() < self.flow_ratio:
@@ -199,12 +208,6 @@ class SplitMeanFlow(nn.Module):
                 alpha_t, sigma_t = self.scheduler.get_cosine_schedule_params(t, self.sigma_min)
                 alpha_t = alpha_t.view(batch_size, 1, 1, 1)
                 sigma_t = sigma_t.view(batch_size, 1, 1, 1)
-            elif self.time_sampling == "cosine":
-                t = torch.rand(batch_size, device=self.device)
-                t = 1 - torch.cos(t * 0.5 * torch.pi)
-                t_ = rearrange(t, "b -> b 1 1 1")
-                alpha_t = t_
-                sigma_t = 1 - (1 - self.sigma_min) * t_
             else:
                 t = torch.rand(batch_size, device=self.device)
                 t_ = rearrange(t, "b -> b 1 1 1")
@@ -223,7 +226,8 @@ class SplitMeanFlow(nn.Module):
             # Get teacher's velocity (with CFG if needed)
             with torch.no_grad():
                 if self.cfg_scale > 0 and self.use_cond:
-                    v_teacher = self.teacher.net.forward_with_cfg(z_t, t, c, self.cfg_scale)
+                    print('t before shape: ', t.shape)
+                    v_teacher = self.teacher.net.forward_with_cfg(z_t, t, c, self.cfg_scale, is_train_student=True)
                 else:
                     v_teacher = self.teacher.net(z_t, t, c)
             
@@ -265,7 +269,7 @@ class SplitMeanFlow(nn.Module):
             u2 = self.student(z_t, s, t, c)
             
             # Compute z_s using the predicted velocity
-            t_s_diff = rearrange(t - s + 1e-8, "b -> b 1 1 1")  # Add small epsilon
+            t_s_diff = rearrange(torch.clamp(t - s, min=1e-5), "b -> b 1 1 1")
             z_s = z_t - t_s_diff * u2
             
             # Forward pass 2: u(z_s, r, s)
@@ -284,95 +288,113 @@ class SplitMeanFlow(nn.Module):
             return loss, "consistency"
     
     @torch.no_grad()
-    def sample_onestep(self, batch_size, c=None, cfg_scale=None):
-        """One-step generation: z_0 = z_1 - u(z_1, 0, 1)"""
-        # Sample initial noise
-        z_1 = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=self.device)
-        
-        # Create time tensors
-        r = torch.zeros(batch_size, device=self.device)
-        t = torch.ones(batch_size, device=self.device)
-        
-        # Generate class labels if needed
-        if self.use_cond and c is None:
+    def sample(self, batch_size=None, class_labels=None, num_steps=1, cfg_scale=None):
+        """General sampling method"""
+        if class_labels is not None:
+            batch_size = class_labels.shape[0]
+            c = class_labels
+        elif self.use_cond and batch_size is not None:
             c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
-        
-        # Predict average velocity over [0, 1]
-        if cfg_scale is not None and cfg_scale > 0:
-            u = self.student.forward_with_cfg(z_1, r, t, c, cfg_scale)
         else:
-            u = self.student(z_1, r, t, c)
+            c = None
         
-        # One-step update
-        z_0 = z_1 - u
-        
-        # Denormalize to [0, 1]
-        z_0 = unnormalize_to_0_1(z_0.clamp(-1, 1))
-        return z_0
+        if num_steps == 1:
+            return self.sample_onestep(batch_size, c, cfg_scale)
+        elif num_steps == 2:
+            return self.sample_twostep(batch_size, c, cfg_scale)
+        else:
+            return self.sample_multistep(batch_size, c, cfg_scale, num_steps)
     
     @torch.no_grad()
-    def sample_twostep(self, batch_size, c=None, cfg_scale=None):
-        """Two-step generation for potentially better quality"""
-        # Sample initial noise
-        z_1 = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=self.device)
+    def sample_onestep(self, batch_size, c=None, cfg_scale=None):
+        """One-step generation: z_1 = z_0 + u(z_0, 0, 1)"""
+        # Sample initial noise at t=0 (not t=1!)
+        z_0 = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=self.device)
         
-        # Generate class labels if needed
+        # Create time tensors
+        r = torch.zeros(batch_size, device=self.device)  # t=0 is noise
+        t = torch.ones(batch_size, device=self.device)   # t=1 is data
+        
         if self.use_cond and c is None:
             c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
         
-        # Step 1: z_1 -> z_0.5
-        # Keep track of both raw and transformed times
-        r1_raw = torch.full((batch_size,), 0.5, device=self.device)
-        t1_raw = torch.ones(batch_size, device=self.device)
-        
-        if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
-            # For inference, use cosine schedule from scheduler
-            r1 = self.scheduler.create_cosine_schedule(2, self.device)[1]  # 0.5 point
-            t1 = self.scheduler.create_cosine_schedule(2, self.device)[2]  # 1.0 point
-            r1 = r1.expand(batch_size)
-            t1 = t1.expand(batch_size)
-        elif self.time_sampling == "cosine":
-            r1 = 1 - torch.cos(r1_raw * 0.5 * torch.pi)
-            t1 = 1 - torch.cos(t1_raw * 0.5 * torch.pi)
+        # Predict average velocity from noise (t=0) to data (t=1)
+        if cfg_scale is not None and cfg_scale > 0:
+            u = self.student.forward_with_cfg(z_0, r, t, c, cfg_scale)
         else:
-            r1 = r1_raw
-            t1 = t1_raw
+            u = self.student(z_0, r, t, c)
+        
+        # Forward update: data = noise + velocity
+        z_1 = z_0 + u  # Note: plus, not minus!
+        
+        return z_1.clamp(-1, 1)
+
+    @torch.no_grad()
+    def sample_twostep(self, batch_size, c=None, cfg_scale=None):
+        """Two-step generation with correct direction"""
+        # Sample initial noise at t=0
+        z_0 = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=self.device)
+        
+        if self.use_cond and c is None:
+            c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
+        
+        # Step 1: z_0 -> z_0.5 (from noise toward data)
+        r1 = torch.zeros(batch_size, device=self.device)
+        t1 = torch.full((batch_size,), 0.5, device=self.device)
         
         if cfg_scale is not None and cfg_scale > 0:
-            u1 = self.student.forward_with_cfg(z_1, r1, t1, c, cfg_scale)
+            u1 = self.student.forward_with_cfg(z_0, r1, t1, c, cfg_scale)
         else:
-            u1 = self.student(z_1, r1, t1, c)
+            u1 = self.student(z_0, r1, t1, c)
         
-        # Use raw time difference for the step
-        z_05 = z_1 - (t1_raw - r1_raw).view(-1, 1, 1, 1) * u1
+        z_05 = z_0 + 0.5 * u1  # Plus! Going from noise to data
         
-        # Step 2: z_0.5 -> z_0
-        r2_raw = torch.zeros(batch_size, device=self.device)
-        t2_raw = torch.full((batch_size,), 0.5, device=self.device)
-        
-        if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
-            r2 = self.scheduler.create_cosine_schedule(2, self.device)[0]  # 0.0 point
-            t2 = self.scheduler.create_cosine_schedule(2, self.device)[1]  # 0.5 point
-            r2 = r2.expand(batch_size)
-            t2 = t2.expand(batch_size)
-        elif self.time_sampling == "cosine":
-            r2 = 1 - torch.cos(r2_raw * 0.5 * torch.pi)
-            t2 = 1 - torch.cos(t2_raw * 0.5 * torch.pi)
-        else:
-            r2 = r2_raw
-            t2 = t2_raw
+        # Step 2: z_0.5 -> z_1 (continue toward data)
+        r2 = torch.full((batch_size,), 0.5, device=self.device)
+        t2 = torch.ones(batch_size, device=self.device)
         
         if cfg_scale is not None and cfg_scale > 0:
             u2 = self.student.forward_with_cfg(z_05, r2, t2, c, cfg_scale)
         else:
             u2 = self.student(z_05, r2, t2, c)
         
-        # Use raw time difference for the step
-        z_0 = z_05 - (t2_raw - r2_raw).view(-1, 1, 1, 1) * u2
+        z_1 = z_05 + 0.5 * u2  # Plus again!
         
-        # Denormalize to [0, 1]
-        z_0 = unnormalize_to_0_1(z_0.clamp(-1, 1))
-        return z_0
+        return z_1.clamp(-1, 1)
+    
+    @torch.no_grad()
+    def sample_multistep(self, batch_size, c=None, cfg_scale=None, num_steps=4):
+        """Multi-step generation for arbitrary number of steps"""
+        # Sample initial noise
+        z = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=self.device)
+        
+        # Generate class labels if needed
+        if self.use_cond and c is None:
+            c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
+        
+        # Create time schedule (uniform for simplicity)
+        t_schedule = torch.linspace(1, 0, num_steps + 1, device=self.device)
+        
+        # Multi-step sampling
+        for i in range(num_steps):
+            r = t_schedule[i + 1]
+            t = t_schedule[i]
+            
+            r_batch = r.expand(batch_size)
+            t_batch = t.expand(batch_size)
+            
+            if cfg_scale is not None and cfg_scale > 0:
+                u = self.student.forward_with_cfg(z, r_batch, t_batch, c, cfg_scale)
+            else:
+                u = self.student(z, r_batch, t_batch, c)
+            
+            # Update z
+            dt = (t - r).item()
+            z = z - dt * u
+        
+        # Clip final output
+        z = z.clamp(-1, 1)
+        return z
     
     @torch.no_grad()
     def sample_each_class(self, n_per_class, num_steps=1, cfg_scale=None):
@@ -380,13 +402,7 @@ class SplitMeanFlow(nn.Module):
         c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
         batch_size = self.num_classes * n_per_class
         
-        if num_steps == 1:
-            return self.sample_onestep(batch_size, c, cfg_scale)
-        elif num_steps == 2:
-            return self.sample_twostep(batch_size, c, cfg_scale)
-        else:
-            raise ValueError(f"Only 1 or 2 step sampling supported, got {num_steps}")
-
+        return self.sample(batch_size=batch_size, class_labels=c, num_steps=num_steps, cfg_scale=cfg_scale)
 
 
 def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
@@ -398,7 +414,6 @@ def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
     if hasattr(teacher_dit, 'register_tokens') and teacher_dit.register_tokens is not None:
         num_register_tokens = teacher_dit.register_tokens.shape[0]
     
-   
     student = SplitMeanFlowDiT(
         input_size=teacher_dit.x_embedder.img_size[0],
         patch_size=teacher_dit.patch_size,
