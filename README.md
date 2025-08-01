@@ -56,7 +56,7 @@ The training follows Algorithm 1 from the paper with some modifications based on
 
 ## Experimental Results
 - [x] Trained MNIST dataset 
-- [] Trained CIFAR10 dataset
+- [ ] Trained CIFAR10 dataset
 
 
 **Disclaimer: These are preliminary results from my implementation and may not match the paper's performance.**
