@@ -3,12 +3,13 @@ from torch import nn
 import torch.nn.functional as F
 from functools import partial
 from tqdm.auto import tqdm
-from dit import DiT
+from dit import SMDiT
 import copy
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from einops import pack, unpack
 from model import LogitNormalCosineScheduler  # Import from teacher's model
+from dit import SMDiT
 
 
 def normalize_to_neg1_1(x):
@@ -19,99 +20,21 @@ def unnormalize_to_0_1(x):
     return (x + 1) * 0.5
 
 
-class SplitMeanFlowDiT(DiT):
-    """
-    Modified DiT that accepts interval inputs (r, t) instead of just t.
-    Inherits from the original DiT and adds interval embedding.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        # Additional embedding for interval information
-        dim = self.t_embedder.mlp[-1].out_features
-        self.interval_embedder = nn.Sequential(
-            nn.Linear(2, dim),  # [r, t] -> dim
-            nn.SiLU(),
-            nn.Linear(dim, dim)
-        )
-        
-        # Initialize to near-zero for stability
-        nn.init.normal_(self.interval_embedder[0].weight, std=0.02)
-        nn.init.zeros_(self.interval_embedder[0].bias)
-        nn.init.zeros_(self.interval_embedder[2].weight)
-        nn.init.zeros_(self.interval_embedder[2].bias)
-    
-    def forward(self, x, r, t, y):
-        """
-        Forward pass with interval inputs.
-        x: (N, C, H, W) tensor of spatial inputs
-        r: (N,) tensor of interval start times
-        t: (N,) tensor of interval end times
-        y: (N,) tensor of class labels
-        """
-        H, W = x.shape[-2:]
-        x_emb = self.x_embedder(x) + self.pos_embed
-        
-        # Pack with register tokens if they exist
-        if hasattr(self, 'register_tokens') and self.register_tokens is not None:
-            r_tokens = repeat(self.register_tokens, 'n d -> b n d', b=x_emb.shape[0])
-            x_emb, ps = pack([x_emb, r_tokens], 'b * d ')
-        
-        # Time embeddings
-        t_emb = self.t_embedder(t)
-        
-        # Interval embedding: encode [r, t] information
-        interval = torch.stack([r, t], dim=-1)  # (N, 2)
-        interval_emb = self.interval_embedder(interval)  # (N, D)
-        
-        # Combine embeddings
-        c = t_emb + interval_emb
-        if self.use_cond:
-            y_emb = self.y_embedder(y, self.training)
-            c = c + y_emb
-        
-        # Process through transformer blocks
-        for block in self.blocks:
-            x_emb = block(x_emb, c)
-        
-        # Unpack and final layer
-        if hasattr(self, 'register_tokens') and self.register_tokens is not None:
-            x_emb, _ = unpack(x_emb, ps, 'b * d')
-            
-        x_out = self.final_layer(x_emb, c)
-        x_out = self.unpatchify(x_out)
-        
-        return x_out
-    
-    def forward_with_cfg(self, x, r, t, y, cfg_scale):
-        """CFG forward for interval inputs"""
-        x = x.repeat(2, 1, 1, 1)
-        r = r.repeat(2)
-        t = t.repeat(2)
-        y = y.repeat(2)
-        y[len(x) // 2:] = self.y_embedder.num_classes
-        
-        model_out = self.forward(x, r, t, y)
-        cond_out, uncond_out = model_out.split(len(x) // 2)
-        out = uncond_out + (cond_out - uncond_out) * cfg_scale
-        return out
-
 
 class SplitMeanFlow(nn.Module):
     def __init__(
         self,
-        student_net: SplitMeanFlowDiT,
-        teacher_model: nn.Module,  # This is RectifiedFlow which contains teacher.net
+        student_net: SMDiT,
+        teacher_model: nn.Module,
         device="cuda",
         channels=3,
         image_size=16,
         num_classes=10,
-        flow_ratio=0.5,  # Fraction of boundary condition training
-        cfg_scale=3.0,   # Fixed CFG scale for teacher
-        time_sampling="logit_normal_cosine",  # Match teacher
+        flow_ratio=0.5,
+        cfg_scale=3.0,
+        time_sampling="logit_normal_cosine",
         sigma_min=1e-06,
-        use_immiscible=True,  # Add immiscible sampling option
-        # LogitNormal parameters to match teacher
+        use_immiscible=True,
         logit_normal_loc=0.0,
         logit_normal_scale=1.0,
         timestep_min=1e-8,
@@ -197,9 +120,10 @@ class SplitMeanFlow(nn.Module):
         x is assumed to be in [-1, 1] already from dataloader
         """
         batch_size = x.shape[0]
+        rand_val = torch.rand(1).item()
         
         # Decide whether to use boundary condition or interval splitting
-        if torch.rand(1).item() < self.flow_ratio:
+        if rand_val < self.flow_ratio:
             # BOUNDARY CONDITION: u(z_t, t, t) = v(z_t, t)
             if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
                 # Use the same sampling as teacher
@@ -236,7 +160,65 @@ class SplitMeanFlow(nn.Module):
             
             loss = F.mse_loss(u_pred, v_teacher)
             return loss, "boundary"
+
+        elif rand_val < self.flow_ratio + 0.1:
+
+            if torch.rand(1).item() < 0.33:
+                # Full interval [0, 1]
+                r = torch.zeros(batch_size, device=self.device)
+                t = torch.ones(batch_size, device=self.device)
+            elif torch.rand(1).item() < 0.66:
+                # First half [0, 0.5]
+                r = torch.zeros(batch_size, device=self.device)
+                t = torch.full((batch_size,), 0.5, device=self.device)
+            else:
+                # Second half [0.5, 1]
+                r = torch.full((batch_size,), 0.5, device=self.device)
+                t = torch.ones(batch_size, device=self.device)
             
+            lam = torch.rand(batch_size, device=self.device)
+            s = (1 - lam) * t + lam * r
+
+            # Get interpolation parameters for z_t
+            if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
+                alpha_t, sigma_t = self.scheduler.get_cosine_schedule_params(t, self.sigma_min)
+                alpha_t = alpha_t.view(batch_size, 1, 1, 1)
+                sigma_t = sigma_t.view(batch_size, 1, 1, 1)
+            else:
+                t_ = rearrange(t, "b -> b 1 1 1")
+                alpha_t = t_
+                sigma_t = 1 - (1 - self.sigma_min) * t_
+            
+            # Sample noise
+            if self.use_immiscible:
+                z = self.sample_immiscible_noise(x)
+            else:
+                z = torch.randn_like(x)
+            
+            # Create z_t using the same interpolation as teacher
+            z_t = sigma_t * z + alpha_t * x
+            
+            # Forward pass 1: u(z_t, s, t)
+            u2 = self.student(z_t, s, t, c)
+            
+            # Compute z_s using the predicted velocity
+            t_s_diff = rearrange(torch.clamp(t - s, min=1e-5), "b -> b 1 1 1")
+            z_s = z_t - t_s_diff * u2
+            
+            # Forward pass 2: u(z_s, r, s)
+            u1 = self.student(z_s, r, s, c)
+            
+            # Construct target using interval splitting consistency
+            lam_ = rearrange(lam, "b -> b 1 1 1")
+            target = (1 - lam_) * u1 + lam_ * u2
+            
+            # Forward pass 3: predict u(z_t, r, t)
+            u_pred = self.student(z_t, r, t, c)
+            
+            # Loss with stop gradient on target
+            loss = F.mse_loss(u_pred, target.detach())
+
+            return loss, "consistency"
         else:
             # INTERVAL SPLITTING CONSISTENCY
             # Sample r < t
@@ -373,12 +355,12 @@ class SplitMeanFlow(nn.Module):
             c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
         
         # Create time schedule (uniform for simplicity)
-        t_schedule = torch.linspace(1, 0, num_steps + 1, device=self.device)
+        t_schedule = torch.linspace(0, 1, num_steps + 1, device=self.device)
         
         # Multi-step sampling
         for i in range(num_steps):
-            r = t_schedule[i + 1]
-            t = t_schedule[i]
+            r = t_schedule[i]
+            t = t_schedule[i + 1]
             
             r_batch = r.expand(batch_size)
             t_batch = t.expand(batch_size)
@@ -390,7 +372,7 @@ class SplitMeanFlow(nn.Module):
             
             # Update z
             dt = (t - r).item()
-            z = z - dt * u
+            z = z + dt * u
         
         # Clip final output
         z = z.clamp(-1, 1)
@@ -414,7 +396,7 @@ def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
     if hasattr(teacher_dit, 'register_tokens') and teacher_dit.register_tokens is not None:
         num_register_tokens = teacher_dit.register_tokens.shape[0]
     
-    student = SplitMeanFlowDiT(
+    student = SMDiT(
         input_size=teacher_dit.x_embedder.img_size[0],
         patch_size=teacher_dit.patch_size,
         in_channels=teacher_dit.in_channels,
