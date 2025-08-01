@@ -4,7 +4,6 @@ import torchvision
 from torchvision import transforms as T
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
-from bitsandbytes.optim import AdamW8bit
 from copy import deepcopy
 from collections import OrderedDict
 
@@ -19,31 +18,32 @@ import torch.nn.functional as F
 
 
 def main():
-    n_steps = 200000
+    n_steps = 400000
     device = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = 64
     
-    # Direct image settings
-    image_size = 16  # Smaller image size for direct generation
-    image_channels = 3  # RGB channels
+    image_size = 32
+    image_channels = 3
     num_classes = 10
+    
     # Create directories
-    os.makedirs('/mnt/nvme/images', exist_ok=True)
-    os.makedirs('/mnt/nvme/results', exist_ok=True)
-    checkpoint_root_path = '/mnt/nvme/checkpoint/dit_direct/'
+    os.makedirs('/mnt/nvme/images_cifar10', exist_ok=True)
+    os.makedirs('/mnt/nvme/results_cifar10', exist_ok=True)
+    checkpoint_root_path = '/checkpoint/dit_cifar10/'
     os.makedirs(checkpoint_root_path, exist_ok=True)
 
     # Initialize Comet ML experiment
     experiment = Experiment(
-        project_name="dit-flow-matching-direct",
+        project_name="dit-flow-matching-cifar10",
     )
     
-    # Log hyperparameters
+   
     experiment.log_parameters({
+        "dataset": "CIFAR-10",
         "n_steps": n_steps,
         "batch_size": batch_size,
         "learning_rate": 1e-4,
-        "model": "DiT-Direct",
+        "model": "DiT-CIFAR10",
         "dim": 384,
         "depth": 12,
         "num_heads": 6,
@@ -57,27 +57,28 @@ def main():
         "training_cfg_rate": 0.2,
         "lambda_weight": 0.05,
         "sigma_min": 1e-06,
+        "ema_decay": 0.9999,
     })
 
-    # Dataset with normalization to [-1, 1]
+    
+    transform = T.Compose([
+        T.ToTensor(),  # Converts to [0, 1]
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  
+    ])
+    
     dataset = torchvision.datasets.CIFAR10(
         root="/mnt/nvme/",
         train=True,
         download=True,
-        transform=T.Compose([
-            T.Resize((image_size, image_size)),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),  # This converts to [0, 1]
-            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # Convert to [-1, 1]
-        ]),
+        transform=transform,
     )
 
-    # Initialize Logit-Normal + Cosine Scheduler (SD3 approach)
+   
     timestep_scheduler = LogitNormalCosineScheduler(
-        loc=0.0,        # SD3 default: symmetric around t=0.5
-        scale=1.0,      # SD3 default: moderate focus on intermediate timesteps
-        min_t=1e-8,     # Avoid singularities
-        max_t=1.0-1e-8  # Avoid singularities
+        loc=0.0,        
+        scale=1.0,      
+        min_t=1e-8,    
+        max_t=1.0-1e-8 
     )
 
     def cycle(iterable):
@@ -86,11 +87,15 @@ def main():
                 yield i
 
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=40
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        drop_last=True, 
+        num_workers=8
     )
     train_dataloader = cycle(train_dataloader)
 
-    # Create model for direct image generation
+    # Create model for CIFAR-10 generation
     model = DiT(
         input_size=image_size,
         patch_size=2,
@@ -103,11 +108,15 @@ def main():
         class_dropout_prob=0.1,
     ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)
+    # Create EMA model
+    ema_model = deepcopy(model).eval()
+    ema_decay = 0.9999
     
-    # Create sampler
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.0001)
+    
+    # Create sampler (use EMA model for sampling)
     sampler = RectifiedFlow(
-        model,
+        ema_model,  # Use EMA model
         device=device,
         channels=image_channels,
         image_size=image_size,
@@ -121,7 +130,7 @@ def main():
     
     scaler = torch.cuda.amp.GradScaler()
 
-    # FID evaluation setup
+    
     fid_subset_size = 1000
     
     def limited_cycle(iterable, max_batches):
@@ -139,11 +148,7 @@ def main():
         root="/mnt/nvme",
         train=True,
         download=False,
-        transform=T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
-            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]),
+        transform=transform,
     )
     
     fid_dataloader = torch.utils.data.DataLoader(
@@ -157,19 +162,25 @@ def main():
     fid_dataloader_limited = limited_cycle(fid_dataloader, fid_batches_needed)
     fid_eval = FIDEvaluation(batch_size, fid_dataloader_limited, sampler, num_fid_samples=100)
     
+    def update_ema(ema_model, model, decay):
+        """Update EMA model parameters"""
+        with torch.no_grad():
+            for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                ema_p.data.lerp_(p.data, 1 - decay)
+    
     def sample_and_log_images():
         """Sample images from model"""
         for cfg_scale in [1.0, 2.5, 5.0]:
             print(f"Sampling images at step {step} with cfg_scale {cfg_scale}...")
             
-            # Sample from model
-            model.eval()
+          
+            ema_model.eval()
             with torch.no_grad():
-                # Use the model's own sampling method
+                
                 samples, trajectory = sampler.sample_each_class(10, cfg_scale=cfg_scale, return_all_steps=True)
                 
                 log_img = make_grid(samples, nrow=10, normalize=True, value_range=(-1, 1))
-                img_save_path = f"/mnt/nvme/images/step{step}_cfg{cfg_scale}.png"
+                img_save_path = f"/mnt/nvme/images_cifar10/step{step}_cfg{cfg_scale}.png"
                 save_image(log_img, img_save_path)
                 
                 experiment.log_image(
@@ -178,20 +189,22 @@ def main():
                     step=step
                 )
                 
-                # Create GIF from trajectory
+                
                 selected_indices = list(range(0, len(trajectory), 5))
                 images_list = []
                 for idx in selected_indices:
                     frame = trajectory[idx]
-                    # Unnormalize frame for visualization [-1,1] to [0,1]
+                    
                     frame = (frame + 1) / 2
                     frame = frame.clamp(0, 1)
+                    
+                    grid = make_grid(frame, nrow=10)
                     images_list.append(
-                        make_grid(frame, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
+                        grid.permute(1, 2, 0).cpu().numpy() * 255
                     )
                 
                 clip = mpy.ImageSequenceClip(images_list, fps=10)
-                gif_path = f"/mnt/nvme/images/step{step}_cfg{cfg_scale}.gif"
+                gif_path = f"/mnt/nvme/images_cifar10/step{step}_cfg{cfg_scale}.gif"
                 clip.write_gif(gif_path)
                 
                 experiment.log_image(
@@ -200,64 +213,65 @@ def main():
                     step=step,
                     image_format="gif"
                 )
-            model.train()
     
     losses = []
     sigma_min = 1e-06
     training_cfg_rate = 0.2
-    lambda_weight = 0.01
+    lambda_weight = 0.001
     use_immiscible = True
+    gradient_clip = 1.0
+    
     with tqdm(range(n_steps), dynamic_ncols=True) as pbar:
-        pbar.set_description("Training DiT Direct")
+        pbar.set_description("Training DiT on CIFAR-10")
         for step in pbar:
             data = next(train_dataloader)
             optimizer.zero_grad()
             
-            # Get images and labels
-            x1 = data[0].to(device)  # Already in [-1, 1] due to normalization
+           
+            x1 = data[0].to(device)
             y = data[1].to(device)
             b = x1.shape[0]
 
-            t = timestep_scheduler.sample_timesteps(b, device)
-            
-            # Step 2: Get cosine-scheduled interpolation parameters
-            alpha_t, sigma_t = timestep_scheduler.get_cosine_schedule_params(t, sigma_min)
+           
+            t = torch.rand(b, device=device)
 
-            # Reshape for broadcasting
+            alpha_t = t
+            sigma_t = 1 - (1 - sigma_min) * t
+
+           
             alpha_t = alpha_t.view(b, 1, 1, 1)
             sigma_t = sigma_t.view(b, 1, 1, 1)
-            # t = t.view(b, 1, 1, 1)
 
-            # sample noise using immiscible training
-            # Apply immiscible diffusion with KNN
+          
             if use_immiscible:
                 k = 4
-                # Generate k noise samples for each data point
+               
                 z_candidates = torch.randn(b, k, image_channels, image_size, image_size, device=x1.device, dtype=x1.dtype)
                 
                 x1_flat = x1.flatten(start_dim=1)  # [b, c*h*w]
                 z_candidates_flat = z_candidates.flatten(start_dim=2)  # [b, k, c*h*w]
                 
-                # Compute distances between each data point and its k noise candidates
+                
                 distances = torch.norm(x1_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
                 
-                # Find the farthest noise sample for each data point (for immiscible)
+                
                 max_distances, max_indices = torch.max(distances, dim=1)  # [b]
                 
-                # Method 1: Using gather with proper indexing
+               
                 batch_indices = torch.arange(b, device=x1.device)
                 z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
                 
             else:
                 # Standard noise sampling
                 z = torch.randn_like(x1)
-            # Interpolate between noise and data
+                
+           
             x_t = sigma_t * z + alpha_t * x1
 
-            # Target velocity
-            u_positive = timestep_scheduler.get_velocity_target(x1, z, sigma_min)
-
-            # Create negative samples for contrastive loss
+           
+            u_positive = x1 - (1 - sigma_min) * z 
+            
+         
             if b > 1:
                 perm = torch.randperm(b, device=x1.device)
                 # Ensure no self-pairing
@@ -268,15 +282,12 @@ def main():
             else:
                 u_negative = u_positive
 
-            # Classifier-free guidance dropout
             if training_cfg_rate > 0:
                 drop_mask = torch.rand(b, device=x1.device) < training_cfg_rate
                 y = torch.where(drop_mask, num_classes, y)
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                # Forward pass
-                t_input = t.squeeze()
-                pred = model(x_t, t_input, y)
+                pred = model(x_t, t, y)
                 
                 # Compute losses
                 positive_loss = F.mse_loss(pred, u_positive)
@@ -286,11 +297,13 @@ def main():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            # Calculate and clip gradient norm
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
 
             scaler.step(optimizer)
             scaler.update()
+            
+            # Update EMA
+            update_ema(ema_model, model, ema_decay)
 
             # Logging
             losses.append(loss.item())
@@ -311,7 +324,7 @@ def main():
                 
                 sample_and_log_images()
 
-            if step % 5000 == 0 or step == n_steps - 1:
+            if step % 10000 == 0 or step == n_steps - 1:
                 # FID evaluation
                 try:
                     print(f"Running FID evaluation on {fid_subset_size} samples...")
@@ -326,14 +339,18 @@ def main():
                 checkpoint_path = os.path.join(checkpoint_root_path, f"step_{step}.pth")
                 state_dict = {
                     "model": model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": step,
                     "config": {
+                        "dataset": "CIFAR-10",
                         "image_size": image_size,
                         "image_channels": image_channels,
                         "sigma_min": sigma_min,
                         "lambda_weight": lambda_weight,
                         "training_cfg_rate": training_cfg_rate,
+                        "gradient_clip": gradient_clip,
+                        "ema_decay": ema_decay,
                     }
                 }
                 torch.save(state_dict, checkpoint_path)
@@ -343,16 +360,19 @@ def main():
                     file_or_folder=checkpoint_path
                 )
 
-    # Final save
-    checkpoint_path = os.path.join(checkpoint_root_path, "model_direct_final.pth")
+    checkpoint_path = os.path.join(checkpoint_root_path, "model_cifar10_final.pth")
     state_dict = {
         "model": model.state_dict(),
+        "ema_model": ema_model.state_dict(),
         "config": {
+            "dataset": "CIFAR-10",
             "image_size": image_size,
             "image_channels": image_channels,
             "sigma_min": sigma_min,
             "lambda_weight": lambda_weight,
             "training_cfg_rate": training_cfg_rate,
+            "gradient_clip": gradient_clip,
+            "ema_decay": ema_decay,
         }
     }
     torch.save(state_dict, checkpoint_path)
