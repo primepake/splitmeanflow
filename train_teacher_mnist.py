@@ -233,7 +233,7 @@ def main():
     losses = []
     sigma_min = 1e-06
     training_cfg_rate = 0.2
-    lambda_weight = 0.0
+    lambda_weight = 0.001
     use_immiscible = True
     gradient_clip = 1.0
     
@@ -248,10 +248,11 @@ def main():
             y = data[1].to(device)
             b = x1.shape[0]
 
-            t = timestep_scheduler.sample_timesteps(b, device)
-            
-            # Step 2: Get cosine-scheduled interpolation parameters
-            alpha_t, sigma_t = timestep_scheduler.get_cosine_schedule_params(t, sigma_min)
+            # t = timestep_scheduler.sample_timesteps(b, device)
+            t = torch.rand(b, device=device)
+
+            alpha_t = t
+            sigma_t = 1 - (1 - sigma_min) * t
 
             # Reshape for broadcasting
             alpha_t = alpha_t.view(b, 1, 1, 1)
@@ -284,8 +285,8 @@ def main():
             x_t = sigma_t * z + alpha_t * x1
 
             # Target velocity
-            u_positive = timestep_scheduler.get_velocity_target(x1, z, sigma_min)
-
+            # u_positive = timestep_scheduler.get_velocity_target(x1, z, sigma_min)
+            u_positive = x1 - (1 - sigma_min) * z
             # Create negative samples for contrastive loss
             if b > 1:
                 perm = torch.randperm(b, device=x1.device)

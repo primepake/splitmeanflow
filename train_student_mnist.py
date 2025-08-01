@@ -1,5 +1,5 @@
 from dit import DiT
-from splitmeanflow import SplitMeanFlowDiT, SplitMeanFlow, create_student_from_teacher
+from splitmeanflow import SplitMeanFlow, create_student_from_teacher
 from model import RectifiedFlow
 import torch
 import torchvision
@@ -12,7 +12,7 @@ import torch.optim as optim
 import os
 import moviepy.editor as mpy
 from comet_ml import Experiment
-
+import torch.nn.functional as F
 
 # Clean EMA functions (same as teacher)
 @torch.no_grad()
@@ -36,6 +36,78 @@ def save_grayscale_grid(samples, filename, nrow=10):
     samples_rgb = samples.repeat(1, 3, 1, 1)
     grid = make_grid(samples_rgb, nrow=nrow, normalize=True, value_range=(-1, 1))
     save_image(grid, filename)
+@torch.no_grad()
+def run_diagnostics(splitmeanflow, step, experiment):
+    """Run diagnostic tests on the model"""
+    device = splitmeanflow.device
+    batch_size = 16
+    
+    # Test 1: Boundary condition accuracy
+    t_test = torch.rand(batch_size, device=device) * 0.8 + 0.1
+    x_test = torch.randn(batch_size, splitmeanflow.channels, 
+                         splitmeanflow.image_size, splitmeanflow.image_size, device=device)
+    z_test = torch.randn_like(x_test)
+    
+    # Create class labels for MNIST
+    y_test = torch.randint(0, splitmeanflow.num_classes, (batch_size,), device=device)
+    
+    # Create z_t
+    if splitmeanflow.scheduler is not None:
+        alpha_t, sigma_t = splitmeanflow.scheduler.get_cosine_schedule_params(t_test, splitmeanflow.sigma_min)
+        alpha_t = alpha_t.view(-1, 1, 1, 1)
+        sigma_t = sigma_t.view(-1, 1, 1, 1)
+    else:
+        t_expand = t_test.view(-1, 1, 1, 1)
+        alpha_t = t_expand
+        sigma_t = 1 - (1 - splitmeanflow.sigma_min) * t_expand
+    
+    z_t = sigma_t * z_test + alpha_t * x_test
+    
+    # Teacher prediction
+    with torch.no_grad():
+        v_teacher = splitmeanflow.teacher.net(z_t, t_test, y_test)  # Pass y_test
+    
+    # Student prediction for boundary condition
+    u_student = splitmeanflow.student(z_t, t_test, t_test, y_test)  # Pass y_test
+    
+    boundary_error = F.mse_loss(u_student, v_teacher).item()
+    
+    # Test 2: Interval consistency
+    r = torch.zeros(batch_size, device=device)
+    t = torch.ones(batch_size, device=device)
+    s = torch.full((batch_size,), 0.5, device=device)
+    
+    u_full = splitmeanflow.student(z_t, r, t, y_test)
+    u_first = splitmeanflow.student(z_t, r, s, y_test)
+    u_second = splitmeanflow.student(z_t, s, t, y_test)
+    
+    consistency_target = 0.5 * u_first + 0.5 * u_second
+    consistency_error = F.mse_loss(u_full, consistency_target).item()
+    
+    # Test 3: Check specific intervals used in sampling
+    # Test [0, 1] interval
+    z_0 = torch.randn_like(x_test)
+    u_01 = splitmeanflow.student(z_0, r, t, y_test)
+    
+    # Test [0, 0.5] and [0.5, 1] intervals
+    u_05_first = splitmeanflow.student(z_0, r, s, y_test)
+    z_05 = z_0 + 0.5 * u_05_first
+    u_05_second = splitmeanflow.student(z_05, s, t, y_test)
+    
+    # Log metrics
+    experiment.log_metric("diagnostic_boundary_error", boundary_error, step=step)
+    experiment.log_metric("diagnostic_consistency_error", consistency_error, step=step)
+    experiment.log_metric("diagnostic_velocity_magnitude", u_full.abs().mean().item(), step=step)
+    experiment.log_metric("diagnostic_u01_magnitude", u_01.abs().mean().item(), step=step)
+    
+    print(f"\n=== Diagnostics at step {step} ===")
+    print(f"Boundary error: {boundary_error:.6f}")
+    print(f"Consistency error: {consistency_error:.6f}")
+    print(f"Velocity magnitude: {u_full.abs().mean().item():.4f}")
+    print(f"[0,1] velocity magnitude: {u_01.abs().mean().item():.4f}")
+    print("="*30)
+
+
 
 
 def main():
@@ -51,18 +123,19 @@ def main():
     
    
     flow_ratio = 0.7
-    teacher_cfg_scale = 5.0
-    time_sampling = "logit_normal_cosine" 
-    sigma_min = 1e-06  
+    teacher_cfg_scale = 2.5
+    time_sampling = "uniform" 
+    sigma_min = 1e-06
+    lr=1e-4
     
    
-    teacher_checkpoint_path = "./mnist_teacher_step_99999.pth"
+    teacher_checkpoint_path = "./mnist_teacher_step_99999_2.pth"
     checkpoint_root_path = '/mnt/nvme/checkpoint/splitmeanflow_mnist/'
     os.makedirs(checkpoint_root_path, exist_ok=True)
     os.makedirs('/mnt/nvme/images_student_mnist', exist_ok=True)
 
     resume_from_checkpoint = False
-    resume_checkpoint_path = "/mnt/nvme/checkpoint/splitmeanflow_mnist/step_49999.pth"
+    resume_checkpoint_path = "step_145000.pth"
     
     experiment = Experiment(
         project_name="splitmeanflow-student-mnist",
@@ -73,7 +146,7 @@ def main():
         "dataset": "MNIST",
         "n_steps": n_steps,
         "batch_size": batch_size,
-        "learning_rate": 1e-4,
+        "learning_rate": lr,
         "model": "SplitMeanFlow-DiT-MNIST",
         "teacher_checkpoint": teacher_checkpoint_path,
         "flow_ratio": flow_ratio,
@@ -196,7 +269,7 @@ def main():
     )
     
     # Optimizer with lower weight decay for MNIST
-    optimizer = optim.Adam(student_net.parameters(), lr=1e-4, weight_decay=0.0001)
+    optimizer = optim.Adam(student_net.parameters(), lr=lr, weight_decay=0.0001)
     scaler = torch.cuda.amp.GradScaler()
 
     # Resume from checkpoint if requested
@@ -370,6 +443,15 @@ def main():
             experiment.log_metric("loss", loss.item(), step=step)
             experiment.log_metric(f"{loss_type}_loss", loss.item(), step=step)
             experiment.log_metric("grad_norm", grad_norm.item(), step=step)
+
+            # if step > 50000:
+            #     flow_ratio = 0.5
+            #     splitmeanflow.flow_ratio = flow_ratio
+            #     splitmeanflow_ema.flow_ratio = flow_ratio
+
+           
+            if step % 5000 == 0:
+                run_diagnostics(splitmeanflow, step, experiment)
             
             if step % 100 == 0:
                 avg_loss = sum(losses[-100:]) / min(100, len(losses))

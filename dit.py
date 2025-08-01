@@ -12,33 +12,6 @@ def modulate(x, scale, shift):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-# class TimestepEmbedder(nn.Module):
-#     def __init__(self, dim, nfreq=256):
-#         super().__init__()
-#         self.mlp = nn.Sequential(nn.Linear(nfreq, dim), nn.SiLU(), nn.Linear(dim, dim))
-#         self.nfreq = nfreq
-
-#     @staticmethod
-#     def timestep_embedding(t, dim, max_period=10000):
-#         half_dim = dim // 2
-#         freqs = torch.exp(
-#             -math.log(max_period)
-#             * torch.arange(start=0, end=half_dim, dtype=torch.float32)
-#             / half_dim
-#         ).to(device=t.device)
-#         args = t[:, None].float() * freqs[None]
-#         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-#         if dim % 2:
-#             embedding = torch.cat(
-#                 [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-#             )
-#         return embedding
-
-#     def forward(self, t):
-#         t_freq = self.timestep_embedding(t, self.nfreq)
-#         t_emb = self.mlp(t_freq)
-#         return t_emb
-
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -78,6 +51,40 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
+class IntervalTimestepEmbedder(nn.Module):
+    """
+    Modified embedder that can handle both single timesteps and intervals [r, t].
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        
+        self.single_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size)
+
+        # Additional embedder for interval information
+        self.interval_embedder = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # Mode flag
+        self.interval_mode = False
+        
+    def forward(self, r_or_t, t=None):
+        """
+        Flexible forward that handles both modes:
+        - Single timestep mode: forward(t) where r_or_t is the timestep
+        - Interval mode: forward(r, t) where r_or_t is r and t is provided
+        """
+       
+        # Interval mode (SplitMeanFlow)
+        r_emb = self.single_embedder(r_or_t)
+        t_emb = self.single_embedder(t)
+        # Combine r and t embeddings
+        combined = torch.cat([r_emb, t_emb], dim=-1)
+        interval_emb = self.interval_embedder(combined)
+        return interval_emb
 
 class LabelEmbedder(nn.Module):
     def __init__(self, num_classes, dim, dropout_prob):
@@ -218,6 +225,8 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        
+
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -277,6 +286,158 @@ class DiT(nn.Module):
         cond_eps, uncond_eps = model_out.split(len(x) // 2)
         out = uncond_eps + (cond_eps - uncond_eps) * cfg_scale
         return out
+
+
+
+class SMDiT(nn.Module):
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        dim=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_register_tokens=4,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+        interval_mode=True,  # New parameter to enable interval mode
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.num_classes = num_classes
+        self.interval_mode = interval_mode
+        
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, dim)
+        
+        # Use the new interval-aware embedder
+        self.t_embedder = IntervalTimestepEmbedder(dim)
+        
+        self.use_cond = num_classes is not None
+        self.y_embedder = LabelEmbedder(num_classes, dim, class_dropout_prob) if self.use_cond else None
+        
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, dim), requires_grad=False)
+        
+        self.blocks = nn.ModuleList([
+            DiTBlock(dim, num_heads, mlp_ratio) for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
+        
+        self.initialize_weights()
+    
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+        
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        if self.y_embedder is not None:
+            nn.init.normal_(self.y_embedder.embedding.weight, std=0.02)
+
+        # Initialize interval embedder:
+        nn.init.normal_(self.t_embedder.interval_embedder[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.interval_embedder[2].weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.single_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.single_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+    
+    def unpatchify(self, x):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def forward(self, x, r_or_t, t=None, y=None):
+        """
+        Forward pass of DiT with flexible timestep handling.
+        
+        Args:
+            x: (N, C, H, W) tensor of spatial inputs
+            r_or_t: In single mode, this is t. In interval mode, this is r.
+            t: In single mode, this is None. In interval mode, this is t.
+            y: (N,) tensor of class labels
+        """
+        # Patch embedding
+        x = self.x_embedder(x) + self.pos_embed
+        
+        # Time embedding (handles both single and interval modes)
+        t_emb = self.t_embedder(r_or_t, t)
+        
+        # Class embedding
+        if self.use_cond and y is not None:
+            y_emb = self.y_embedder(y, self.training)
+            c = t_emb + y_emb
+        else:
+            c = t_emb
+        
+        # Process through transformer blocks
+        for block in self.blocks:
+            x = block(x, c)
+        
+        # Final layer
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        return x
+
+    def forward_with_cfg(self, x, r_or_t, t=None, y=None, cfg_scale=1.0):
+        """
+        Forward with classifier-free guidance, supporting both modes.
+        """
+    
+        x = x.repeat(2, 1, 1, 1)
+        r_or_t = r_or_t.repeat(2)
+        t = t.repeat(2)
+        y = y.repeat(2) if y is not None else None
+        if self.use_cond and y is not None:
+            y[len(x) // 2:] = self.y_embedder.num_classes
+        
+        model_out = self.forward(x, r_or_t, t, y)
+        
+        cond_out, uncond_out = model_out.split(len(x) // 2)
+        out = uncond_out + (cond_out - uncond_out) * cfg_scale
+        return out
+
 
 # Positional embedding from:
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
