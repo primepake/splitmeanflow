@@ -69,14 +69,6 @@ The training follows Algorithm 1 from the paper with some modifications based on
 3. **CFG Handling**: My interpretation of CFG-free training might differ from the official approach
 4. **Time Sampling**: Using uniform sampling instead of log-normal as mentioned in paper
 
-## TODOs
-
-- [ ] Implement log-normal time sampling
-- [ ] Add proper evaluation pipeline (FID, IS, etc.)
-- [ ] Experiment with different architectures (U-Net, etc.)
-- [ ] Add visualization tools for debugging
-- [ ] Implement the MeanFlow baseline for comparison
-- [ ] Multi-GPU distributed training
 
 ## Contributing
 
