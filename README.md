@@ -90,7 +90,6 @@ Please cite the original paper:
 
 - Original paper by ByteDance Seed team
 - DiT implementation adapted from [facebookresearch/DiT](https://github.com/facebookresearch/DiT)
-- Training loop structure inspired by [Just-a-DIT](https://github.com/ArchiMickey/Just-a-DiT)
 - Thanks to the authors for the clear paper and algorithm descriptions
 
 ## License
