@@ -36,61 +36,28 @@ You can download the teacher model at [model](https://github.com/primepake/split
 ### Stage 2: Student Model  
 Then train the SplitMeanFlow student:
 ```bash
-python train_student.py --teacher_path checkpoints/teacher_final.pt
+python train_student.py
 ```
+
+Samples in training:
+
+### 1st Step <br/>
+![Samples](assets/1step.jpg)
+
+### 2st Step <br/>
+![Samples](assets/2step.jpg)
+
+### 4st Step <br/>
+![Samples](assets/4step.jpg)
+
+The training log here: ![training log comet](assets/student_mnist_log.png)
 
 The training follows Algorithm 1 from the paper with some modifications based on my interpretation.
 
-## Usage
-
-```python
-from models.splitmeanflow import SplitMeanFlowDiT
-from sampler import Sampler
-
-# Load model
-model = SplitMeanFlowDiT(
-    input_size=32,
-    patch_size=2,
-    in_channels=3,
-    dim=384,
-    depth=12,
-    num_heads=6,
-    num_classes=10,
-).cuda()
-
-model.load_state_dict(torch.load('checkpoints/student_best.pt'))
-
-# One-step sampling
-sampler = Sampler(model)
-samples = sampler.sample_onestep(batch_size=16)
-```
-
-## Key Implementation Details
-
-### Interval Splitting Consistency Loss
-My implementation of the core training objective:
-```python
-def interval_splitting_loss(model, x, teacher_model=None, flow_ratio=0.5):
-    # Sample times r < s < t
-    r, t = sorted(torch.rand(2))
-    lambda_val = torch.rand(1)
-    s = (1 - lambda_val) * t + lambda_val * r
-    
-    # Implementation details following Algorithm 1
-    # ...
-```
-
-### Architecture Modifications
-The DiT model is modified to accept interval inputs:
-```python
-class SplitMeanFlowDiT(nn.Module):
-    def forward(self, x, r, t, y=None):
-        # Added interval embedding layer
-        interval_emb = self.interval_embed(torch.stack([r, t], dim=-1))
-        # ... rest of DiT forward pass
-```
-
 ## Experimental Results
+- [x] Trained MNIST dataset 
+- [] Trained CIFAR10 dataset
+
 
 **Disclaimer: These are preliminary results from my implementation and may not match the paper's performance.**
 
