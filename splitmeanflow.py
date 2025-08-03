@@ -82,10 +82,10 @@ class SplitMeanFlow(nn.Module):
         distances = torch.norm(x_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
         
         # Find the farthest noise sample for each data point
-        max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+        min_distances, min_indices = torch.min(distances, dim=1)  # [b]
         
         batch_indices = torch.arange(b, device=x.device)
-        z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+        z = z_candidates[batch_indices, min_indices]  # [b, c, h, w]
         return z
     
     def sample_times(self, batch_size):
@@ -122,7 +122,6 @@ class SplitMeanFlow(nn.Module):
         batch_size = x.shape[0]
         rand_val = torch.rand(1).item()
         
-        # Decide whether to use boundary condition or interval splitting
         if rand_val < self.flow_ratio:
             # BOUNDARY CONDITION: u(z_t, t, t) = v(z_t, t)
             if self.time_sampling == "logit_normal_cosine" and self.scheduler is not None:
@@ -201,8 +200,7 @@ class SplitMeanFlow(nn.Module):
             # Forward pass 1: u(z_t, s, t)
             u2 = self.student(z_t, s, t, c)
             
-            # Compute z_s using the predicted velocity
-            t_s_diff = rearrange(torch.clamp(t - s, min=1e-5), "b -> b 1 1 1")
+            t_s_diff = rearrange(t - s, "b -> b 1 1 1")
             z_s = z_t - t_s_diff * u2
             
             # Forward pass 2: u(z_s, r, s)
@@ -251,7 +249,7 @@ class SplitMeanFlow(nn.Module):
             u2 = self.student(z_t, s, t, c)
             
             # Compute z_s using the predicted velocity
-            t_s_diff = rearrange(torch.clamp(t - s, min=1e-5), "b -> b 1 1 1")
+            t_s_diff = t_s_diff = rearrange(t - s, "b -> b 1 1 1")
             z_s = z_t - t_s_diff * u2
             
             # Forward pass 2: u(z_s, r, s)
@@ -409,15 +407,26 @@ def create_student_from_teacher(teacher_dit, teacher_checkpoint_path=None):
         learn_sigma=teacher_dit.learn_sigma,
     )
     
-    # Initialize student from teacher weights
-    # Copy all matching parameters
     teacher_state = teacher_dit.state_dict()
     student_state = student.state_dict()
     
-    for name, param in teacher_state.items():
-        if name in student_state and param.shape == student_state[name].shape:
-            student_state[name].copy_(param)
+    for teacher_key, teacher_param in teacher_state.items():
+        if 't_embedder' in teacher_key:
+            # Map teacher t_embedder to student's single_embedder
+            student_key = teacher_key.replace('t_embedder', 't_embedder.single_embedder')
+            if student_key in student_state:
+                print(f"Copying {teacher_key} -> {student_key}")
+                student_state[student_key].copy_(teacher_param)
+        elif teacher_key in student_state and teacher_param.shape == student_state[teacher_key].shape:
+            # Copy other matching parameters
+            print(f"Copying {teacher_key}")
+            student_state[teacher_key].copy_(teacher_param)
+    
     
     student.load_state_dict(student_state)
+    
+    print("\nVerifying weight transfer:")
+    print(f"Teacher t_embedder.mlp[0].weight mean: {teacher_dit.t_embedder.mlp[0].weight.mean().item():.4f}")
+    print(f"Student single_embedder.mlp[0].weight mean: {student.t_embedder.single_embedder.mlp[0].weight.mean().item():.4f}")
     
     return student

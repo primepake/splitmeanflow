@@ -15,12 +15,35 @@ from comet_ml import Experiment
 import os
 import torch.optim as optim
 import torch.nn.functional as F
+import glob
+
+def find_latest_checkpoint(checkpoint_root_path):
+    """Find the latest checkpoint in the directory"""
+    checkpoint_files = glob.glob(os.path.join(checkpoint_root_path, "step_*.pth"))
+    if not checkpoint_files:
+        return None
+    
+    # Extract step numbers and find the latest
+    steps = []
+    for f in checkpoint_files:
+        try:
+            step = int(os.path.basename(f).replace("step_", "").replace(".pth", ""))
+            steps.append((step, f))
+        except:
+            continue
+    
+    if not steps:
+        return None
+    
+    # Return the checkpoint with the highest step number
+    latest_step, latest_checkpoint = max(steps, key=lambda x: x[0])
+    return latest_checkpoint, latest_step
 
 
 def main():
     n_steps = 400000
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 64
+    batch_size = 128
     
     image_size = 32
     image_channels = 3
@@ -31,6 +54,11 @@ def main():
     os.makedirs('/mnt/nvme/results_cifar10', exist_ok=True)
     checkpoint_root_path = '/checkpoint/dit_cifar10/'
     os.makedirs(checkpoint_root_path, exist_ok=True)
+
+    # Check for existing checkpoints
+    checkpoint_info = find_latest_checkpoint(checkpoint_root_path)
+    resume_from_checkpoint = checkpoint_info is not None
+    start_step = 0
 
     # Initialize Comet ML experiment
     experiment = Experiment(
@@ -60,11 +88,8 @@ def main():
         "ema_decay": 0.9999,
     })
 
+    transform=T.Compose([T.ToTensor(), T.RandomHorizontalFlip()])
     
-    transform = T.Compose([
-        T.ToTensor(),  # Converts to [0, 1]
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  
-    ])
     
     dataset = torchvision.datasets.CIFAR10(
         root="/mnt/nvme/",
@@ -112,7 +137,31 @@ def main():
     ema_model = deepcopy(model).eval()
     ema_decay = 0.9999
     
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # Load checkpoint if available
+    if resume_from_checkpoint:
+        checkpoint_path, start_step = checkpoint_info
+        print(f"Resuming from checkpoint: {checkpoint_path} at step {start_step}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Load model states
+        model.load_state_dict(checkpoint['model'])
+        ema_model.load_state_dict(checkpoint['ema_model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        # Update start step (checkpoint saves the current step, so we start from the next one)
+        start_step = checkpoint['step'] + 1
+        
+        # Log checkpoint info
+        experiment.log_metric("resumed_from_step", start_step, step=start_step)
+        experiment.log_other("resumed_checkpoint_path", checkpoint_path)
+        
+        # Load config if needed (optional - can be used to verify consistency)
+        if 'config' in checkpoint:
+            loaded_config = checkpoint['config']
+            print(f"Loaded configuration: {loaded_config}")
     
     # Create sampler (use EMA model for sampling)
     sampler = RectifiedFlow(
@@ -221,14 +270,18 @@ def main():
     use_immiscible = True
     gradient_clip = 1.0
     
-    with tqdm(range(n_steps), dynamic_ncols=True) as pbar:
-        pbar.set_description("Training DiT on CIFAR-10")
-        for step in pbar:
+    remaining_steps = n_steps - start_step
+    
+    with tqdm(range(remaining_steps), dynamic_ncols=True) as pbar:
+        pbar.set_description(f"Training DiT on CIFAR-10 (starting from step {start_step})")
+        for idx in pbar:
+            step = start_step + idx
             data = next(train_dataloader)
             optimizer.zero_grad()
             
            
             x1 = data[0].to(device)
+            x1 = x1 * 2 - 1
             y = data[1].to(device)
             b = x1.shape[0]
 
@@ -255,11 +308,11 @@ def main():
                 distances = torch.norm(x1_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
                 
                 
-                max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+                min_distances, min_indices = torch.min(distances, dim=1)  # [b]
                 
                
                 batch_indices = torch.arange(b, device=x1.device)
-                z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+                z = z_candidates[batch_indices, min_indices]  # [b, c, h, w]
                 
             else:
                 # Standard noise sampling

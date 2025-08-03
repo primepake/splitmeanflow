@@ -303,7 +303,7 @@ class SMDiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        interval_mode=True,  # New parameter to enable interval mode
+        interval_mode=True,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma

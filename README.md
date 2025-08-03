@@ -20,7 +20,9 @@ conda activate splitmeanflow
 
 ## Training
 
-### Stage 1: Teacher Model
+### MNIST dataset
+
+#### Stage 1: Teacher Model
 First, train a standard flow matching teacher:
 ```bash
 python train_teacher_mnist.py
@@ -33,10 +35,11 @@ Samples in training:
 The training log here: ![training log comet](assets/mnist_log.png)
 
 You can download the teacher model at [model](https://github.com/primepake/splitmeanflow/releases/tag/mnist)
-### Stage 2: Student Model  
+
+#### Stage 2: Student Model  
 Then train the SplitMeanFlow student:
 ```bash
-python train_student.py
+python train_student_mist.py
 ```
 
 Samples in training:
@@ -52,11 +55,48 @@ Samples in training:
 
 The training log here: ![training log comet](assets/student_mnist_log.png)
 
+
+### CIFAR10 dataset
+
+#### Stage 1: Teacher Model
+First, train a standard flow matching teacher:
+```bash
+python train_teacher.py
+```
+
+Samples in training:
+
+![Samples](assets/step200000_cfg5.0.gif)
+
+The training log here: ![training log comet](assets/cifar10_log.png)
+
+You can download the teacher model at [model](https://github.com/primepake/splitmeanflow/releases/tag/cifar10)
+
+#### Stage 2: Student Model  
+Then train the SplitMeanFlow student:
+```bash
+python train_student.py
+```
+
+Samples in training:
+
+### 1st Step <br/>
+![Samples](assets/cifar10_1step.jpg)
+
+### 2st Step <br/>
+![Samples](assets/cifar10_2step.jpg)
+
+### 4st Step <br/>
+![Samples](assets/cifar10_4step.jpg)
+
+The training log here: ![training log comet](assets/student_cifar10_log.png)
+
+
 The training follows Algorithm 1 from the paper with some modifications based on my interpretation.
 
 ## Experimental Results
 - [x] Trained MNIST dataset 
-- [ ] Trained CIFAR10 dataset
+- [x] Trained CIFAR10 dataset
 
 
 **Disclaimer: These are preliminary results from my implementation and may not match the paper's performance.**
