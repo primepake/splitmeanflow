@@ -82,10 +82,10 @@ class SplitMeanFlow(nn.Module):
         distances = torch.norm(x_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
         
         # Find the farthest noise sample for each data point
-        max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+        min_distances, min_indices = torch.min(distances, dim=1)  # [b]
         
         batch_indices = torch.arange(b, device=x.device)
-        z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+        z = z_candidates[batch_indices, min_indices]  # [b, c, h, w]
         return z
     
     def sample_times(self, batch_size):

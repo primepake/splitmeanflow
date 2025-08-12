@@ -255,11 +255,11 @@ def main():
                 distances = torch.norm(x1_flat.unsqueeze(1) - z_candidates_flat, dim=2)  # [b, k]
                 
                 
-                max_distances, max_indices = torch.max(distances, dim=1)  # [b]
+                min_distances, min_indices = torch.min(distances, dim=1)  # [b]
                 
                
                 batch_indices = torch.arange(b, device=x1.device)
-                z = z_candidates[batch_indices, max_indices]  # [b, c, h, w]
+                z = z_candidates[batch_indices, min_indices]  # [b, c, h, w]
                 
             else:
                 # Standard noise sampling
